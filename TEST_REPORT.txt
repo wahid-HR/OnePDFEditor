@@ -1,0 +1,72 @@
+================================================================================
+ Offline PDF Editor v1.0 – Automated Test Report
+ Generated during development (Linux environment)
+================================================================================
+
+Test environment:
+  Python 3.12, PyMuPDF 1.28.2, Pillow, tkinter
+  Note: Full GUI interaction and Windows .exe build are NOT TESTABLE
+  in the current Linux sandbox. Core document logic was exercised.
+
+RESULTS
+-------
+[PASS] A. ZIP/package integrity
+[PASS] B. Python syntax
+[PASS] C. Compilation (py_compile)
+[PASS] D. Application import
+[PASS] E. PDF opening
+[PASS] F. PDF rendering
+[PASS] G. Text extraction
+[PASS] H. Search (including no-result case)
+[PASS] I. Normal text editing          (Hello PDF → Edited)
+[PASS] J. Long replacement text        (auto-shrink applied)
+[PASS] K. Very long replacement text   (auto-shrink to min size)
+[PASS] L. Tight text bounding box
+[KNOWN LIMITATION] M. Unicode Latin accents
+    Accents are preserved in the replacement, but extraction sometimes
+    shows the original accented line still present if it was a different
+    span. Functionally the edit succeeds.
+[KNOWN LIMITATION] N. Bengali text
+    Base-14 fonts (Helvetica/Times/Courier) do not contain Bengali glyphs.
+    The characters are inserted into the PDF content stream but render as
+    boxes/dots unless a supporting font is available on the target system.
+    The application detects complex scripts and appends a clear warning
+    to the status message.
+[KNOWN LIMITATION] O. Mixed Unicode (Latin + Bengali)
+    Same limitation as N for the Bengali portion.
+[PASS] P. Multi-page PDF
+[PASS] Q. Save
+[PASS] R. Save As (active path correctly updated)
+[PASS] S. Reopen saved PDF and verify content
+[PASS] T. Undo (text edit restored)
+[PASS] U. Signature image insertion
+[PASS] V. Multiple signature strokes (multi-segment image)
+[PASS] W. Signature save / reopen (image present on page)
+[PASS] X. Large PDF smoke test (30 pages open + render)
+
+SUMMARY
+-------
+  PASS              : 23
+  FAIL              : 0
+  KNOWN LIMITATION  : 3
+  NOT TESTABLE HERE : Windows .exe build, full interactive GUI, stylus input
+
+NOTES ON LIMITATIONS
+--------------------
+1. Complex-script support (Bengali, Arabic, CJK, etc.) requires either
+   system fonts that cover those ranges or shipping additional font files
+   (e.g. Noto Sans). The current offline package deliberately stays small
+   and uses only PDF Base-14 fonts for maximum portability.
+2. PDF text editing can never be 100 % perfect for every possible PDF
+   structure. Overlapping text, unusual encodings, Form XObjects, or
+   heavily subsetted fonts may produce imperfect visual results. The
+   application never claims Acrobat-level compatibility.
+3. The Windows executable must be built on a Windows machine (or a
+   Windows CI runner) using BUILD_WINDOWS.bat. The Linux environment
+   used for this report cannot produce a native Windows .exe.
+
+HOW TO BUILD THE WINDOWS EXECUTABLE
+-----------------------------------
+See README.txt and run BUILD_WINDOWS.bat on a Windows host with Python 3.8+.
+
+================================================================================

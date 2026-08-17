@@ -1,0 +1,46 @@
+================================================
+One PDF Editor — নতুন GitHub রিপো (সহজ গাইড)
+Yumdrop Tech. Studio · 2026 · v1.0
+================================================
+
+১) GitHub.com এ লগইন করুন
+
+২) New repository তৈরি করুন
+   - উপরের + → New repository
+   - Repository name: OnePDFEditor  (যেকোনো নাম)
+   - Public
+   - Add a README টিক দেবেন না
+   - Create repository
+
+৩) এই ZIP এর ভিতরের সব ফাইল আপলোড
+   - Create repository এর পর "uploading an existing file" লিংক
+     অথবা Code ট্যাব → Add file → Upload files
+   - ZIP খুলে OfflinePDFEditor ফোল্ডারের ভিতরের
+     সব কিছু (app, assets, .github, *.txt, *.spec, requirements.txt)
+     টেনে GitHub আপলোড বক্সে ছাড়ুন
+   - Commit changes
+
+   গুরুত্বপূর্ণ গঠন (রুটে থাকবে):
+   app/
+   assets/
+   .github/
+   OfflinePDFEditor.spec
+   requirements.txt
+   README.txt
+   ...
+
+৪) Actions চালু (প্রথমবার)
+   - Actions ট্যাব → "I understand my workflows..." Allow চাপুন (আসলে)
+
+৫) বিল্ড
+   - Actions → Build Windows EXE → Run workflow → Run workflow
+   - ১০–১৫ মিনিট অপেক্ষা → সবুজ টিক
+   - Artifacts → OnePDFEditor-Windows ডাউনলোড
+
+৬) PC তে ব্যবহার
+   - ZIP extract
+   - OnePDFEditor.exe এবং _internal একসাথে রাখুন
+   - OnePDFEditor.exe চালান
+   - Properties → Unblock (থাকলে)
+
+================================================
