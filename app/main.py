@@ -1321,6 +1321,8 @@ class OnePDFEditor(tk.Tk):
         self.pdf = PDFDocument()
         self.current_page = 0
         self.zoom = DEFAULT_ZOOM
+        self.page_layout = []
+        self.photos = []
         self.photo = None
         self.search_results = []
         self.search_index = -1
@@ -1467,9 +1469,8 @@ class OnePDFEditor(tk.Tk):
         menubar.add_cascade(label="Help", menu=help_m)
         help_m.add_command(label="About", command=self.show_about)
 
-        toolbar = tk.Frame(self, bg=COLORS["toolbar"], height=48)
+        toolbar = tk.Frame(self, bg=COLORS["toolbar"])
         toolbar.pack(side=tk.TOP, fill=tk.X)
-        toolbar.pack_propagate(False)
         inner = tk.Frame(toolbar, bg=COLORS["toolbar"])
         inner.pack(side=tk.LEFT, padx=8, pady=6)
         for text, cmd in [("Open", self.open_file), ("Save", self.save_pdf), ("Save As", self.save_as_pdf)]:
@@ -1485,8 +1486,8 @@ class OnePDFEditor(tk.Tk):
                           ("Fill Box", self.start_fill_box), ("Screenshot", self.take_screenshot)]:
             self._make_tool_btn(inner, text, cmd).pack(side=tk.LEFT, padx=3)
         tk.Frame(inner, width=12, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
-        self._make_tool_btn(inner, "<", self.prev_page).pack(side=tk.LEFT, padx=2)
-        self._make_tool_btn(inner, ">", self.next_page).pack(side=tk.LEFT, padx=2)
+        self._make_tool_btn(inner, "◀ Prev", self.prev_page).pack(side=tk.LEFT, padx=2)
+        self._make_tool_btn(inner, "Next ▶", self.next_page).pack(side=tk.LEFT, padx=2)
         tk.Label(inner, text="Page", bg=COLORS["toolbar"], fg=COLORS["text_dim"], font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(8, 2))
         self.page_var = tk.StringVar(value="1")
         page_entry = tk.Entry(inner, textvariable=self.page_var, width=4, bg=COLORS["surface2"], fg=COLORS["text"],
@@ -1563,6 +1564,10 @@ class OnePDFEditor(tk.Tk):
         self.bind("<Escape>", lambda e: self._cancel_ops())
         self.bind("<Prior>", lambda e: self.prev_page())
         self.bind("<Next>", lambda e: self.next_page())
+        self.bind("<Left>", lambda e: self.prev_page())
+        self.bind("<Right>", lambda e: self.next_page())
+        self.bind("<Up>", lambda e: self.prev_page())
+        self.bind("<Down>", lambda e: self.next_page())
 
     def open_file(self):
         if self.pdf.dirty:
@@ -1603,7 +1608,8 @@ class OnePDFEditor(tk.Tk):
             self.fit_width()
             name = os.path.basename(path)
             kind = self.pdf.source_type.upper()
-            self.status.config(text=f"Opened ({kind}): {name}")
+            n = self.pdf.page_count()
+            self.status.config(text=f"Opened ({kind}): {name}  ·  {n} page(s)  ·  use < > or PageUp/PageDown")
             try:
                 self.drop_hint.pack_forget()
             except Exception:
@@ -1688,23 +1694,36 @@ class OnePDFEditor(tk.Tk):
         else:
             self.status.config(text="Nothing to redo")
 
-    def prev_page(self):
+    def prev_page(self, event=None):
+        if not self.pdf.doc:
+            return
         if self.current_page > 0:
             self._cancel_inline_edit()
+            self._move_active = False
             self.current_page -= 1
             self.highlight_rect = None
             self.selected_span = None
             self._update_page_ui()
             self.render_page()
+            self.scroll_to_page(self.current_page)
+        else:
+            self.status.config(text="Already on first page")
 
-    def next_page(self):
-        if self.pdf.doc and self.current_page < self.pdf.page_count() - 1:
+    def next_page(self, event=None):
+        if not self.pdf.doc:
+            return
+        n = self.pdf.page_count()
+        if self.current_page < n - 1:
             self._cancel_inline_edit()
+            self._move_active = False
             self.current_page += 1
             self.highlight_rect = None
             self.selected_span = None
             self._update_page_ui()
             self.render_page()
+            self.scroll_to_page(self.current_page)
+        else:
+            self.status.config(text=f"Already on last page ({n})")
 
     def _goto_page(self, event=None):
         try:
@@ -1746,69 +1765,178 @@ class OnePDFEditor(tk.Tk):
         self.set_zoom((cw - 24) / page.rect.width)
 
     def _update_page_ui(self):
-        n = self.pdf.page_count()
+        n = self.pdf.page_count() if self.pdf.doc else 0
+        cur = (self.current_page + 1) if n else 0
+        if self.current_page >= n and n > 0:
+            self.current_page = n - 1
+            cur = n
         self.page_count_lbl.config(text=f"/ {n}")
-        self.page_var.set(str(self.current_page + 1))
+        self.page_var.set(str(cur) if n else "-")
+        try:
+            name = os.path.basename(self.pdf.path) if self.pdf.path else ""
+            if n:
+                self.status.config(text=f"Page {cur} of {n}" + (f"  ·  {name}" if name else ""))
+        except Exception:
+            pass
 
     def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        if not self.pdf.doc and not getattr(self, "_dash_photos", None):
+            return
+        delta = 0
+        if getattr(event, "delta", 0):
+            delta = int(-1 * (event.delta / 120))
+        elif getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        if not delta:
+            return
+        # Ctrl + wheel = zoom
+        try:
+            if event.state & 0x0004:
+                self.set_zoom(self.zoom * (1.1 if delta < 0 else (1 / 1.1)))
+                return
+        except Exception:
+            pass
+        self.canvas.yview_scroll(delta, "units")
+        # Update current page from scroll position
+        try:
+            self._sync_page_from_scroll()
+        except Exception:
+            pass
+
+
+    def _sync_page_from_scroll(self):
+        if not self.page_layout:
+            return
+        # top of visible area
+        try:
+            top_frac = self.canvas.yview()[0]
+            y = top_frac * float(self.canvas.bbox("all")[3])
+        except Exception:
+            return
+        for pl in self.page_layout:
+            if pl["y0"] <= y < pl["y1"]:
+                if self.current_page != pl["idx"]:
+                    self.current_page = pl["idx"]
+                    self._update_page_ui()
+                return
+
+    def scroll_to_page(self, page_idx):
+        for pl in self.page_layout:
+            if pl["idx"] == page_idx:
+                try:
+                    total = float(self.canvas.bbox("all")[3]) or 1.0
+                    self.canvas.yview_moveto(max(0.0, pl["y0"] / total))
+                except Exception:
+                    pass
+                return
 
     def render_page(self):
+        """Render ALL pages stacked vertically for continuous mouse scroll."""
         self.canvas.delete("all")
         self.photo = None
+        self.photos = []
+        self.page_layout = []
         if not self.pdf.doc:
             self._show_dashboard()
             return
         self._stop_dashboard()
-        page = self.pdf.get_page(self.current_page)
-        if not page:
-            return
         try:
             mat = fitz.Matrix(self.zoom, self.zoom)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            self.photo = ImageTk.PhotoImage(img)
-            self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo, tags="page")
-            self.canvas.config(scrollregion=(0, 0, pix.width, pix.height))
-            if self.highlight_rect:
-                r = self.highlight_rect * self.zoom
+            y = 0.0
+            gap = 16
+            max_w = 0
+            n = self.pdf.page_count()
+            for i in range(n):
+                page = self.pdf.get_page(i)
+                if not page:
+                    continue
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                photo = ImageTk.PhotoImage(img)
+                self.photos.append(photo)
+                # centered-ish left margin 0
+                self.canvas.create_image(0, y, anchor=tk.NW, image=photo, tags=("page", f"p{i}"))
+                # subtle page separator label
+                self.canvas.create_text(
+                    8, y + 6, anchor=tk.NW, text=f"Page {i + 1} / {n}",
+                    fill="#64748b", font=("Segoe UI", 8), tags=("pagelabel", f"p{i}"),
+                )
+                h = float(pix.height)
+                w = float(pix.width)
+                self.page_layout.append({"idx": i, "y0": y, "y1": y + h, "w": w, "h": h})
+                max_w = max(max_w, w)
+                y += h + gap
+            total_h = max(y - gap, 1)
+            self.canvas.config(scrollregion=(0, 0, max_w, total_h), bg="#1a1a24")
+
+            # Overlays for current interaction page
+            def canvas_rect(page_idx, rect):
+                off = 0.0
+                for pl in self.page_layout:
+                    if pl["idx"] == page_idx:
+                        off = pl["y0"]
+                        break
+                r = fitz.Rect(rect) * self.zoom
+                return fitz.Rect(r.x0, r.y0 + off, r.x1, r.y1 + off)
+
+            if self.highlight_rect is not None:
+                r = canvas_rect(self.current_page, self.highlight_rect)
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#fbbf24", width=2, tags="highlight")
-            if self.selected_span and self.selected_page == self.current_page:
-                r = fitz.Rect(self.selected_span["bbox"])
+            if self.selected_span and self.selected_page is not None:
+                r0 = fitz.Rect(self.selected_span["bbox"])
                 if self._move_active and self._move_delta:
-                    r = fitz.Rect(r.x0 + self._move_delta[0], r.y0 + self._move_delta[1],
-                                  r.x1 + self._move_delta[0], r.y1 + self._move_delta[1])
-                r = r * self.zoom
+                    r0 = fitz.Rect(
+                        r0.x0 + self._move_delta[0], r0.y0 + self._move_delta[1],
+                        r0.x1 + self._move_delta[0], r0.y1 + self._move_delta[1],
+                    )
+                r = canvas_rect(self.selected_page, r0)
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#4ade80", width=2, tags="selected")
-                # ghost label while dragging
-                if self._move_active and (abs(self._move_delta[0]) > 0.5 or abs(self._move_delta[1]) > 0.5):
-                    self.canvas.create_text(r.x0, max(0, r.y0 - 12), text="↕ move",
-                                            fill="#4ade80", font=("Segoe UI", 8), anchor=tk.NW, tags="selected")
             if self.placing_signature and self.sig_rect:
-                r = self.sig_rect * self.zoom
+                r = canvas_rect(self.current_page, self.sig_rect)
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#7c5cff", width=2, dash=(4, 2), tags="sigpreview")
             if self.fill_mode and self.fill_rect:
-                r = self.fill_rect * self.zoom
+                r = canvas_rect(self.current_page, self.fill_rect)
                 if self.fill_color_manual and self.fill_color:
                     c = self.fill_color
-                    fill_hex = "#%02x%02x%02x" % (int(c[0]*255), int(c[1]*255), int(c[2]*255))
+                    fill_hex = "#%02x%02x%02x" % (int(c[0] * 255), int(c[1] * 255), int(c[2] * 255))
                 else:
                     fill_hex = "#cccccc"
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#f87171", width=2,
                                             fill=fill_hex, stipple="gray50", tags="fillpreview")
             if self.copy_sign_mode and self.copy_sign_rect:
-                r = self.copy_sign_rect * self.zoom
+                r = canvas_rect(self.current_page, self.copy_sign_rect)
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#22d3ee", width=2,
                                             dash=(4, 2), tags="copysignpreview")
             if self.screenshot_mode and self.screenshot_rect:
-                r = self.screenshot_rect * self.zoom
+                r = canvas_rect(self.current_page, self.screenshot_rect)
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#fbbf24", width=2,
                                             dash=(5, 3), tags="sspreview")
         except Exception as e:
             self.status.config(text=f"Render error: {e}")
 
     def _canvas_to_pdf(self, x, y):
-        return fitz.Point(x / self.zoom, y / self.zoom)
+        """Map canvas coords to PDF page coords; updates current_page from Y position."""
+        page_idx = self.current_page
+        local_y = y
+        for pl in self.page_layout:
+            if pl["y0"] <= y <= pl["y1"] + 8:
+                page_idx = pl["idx"]
+                local_y = y - pl["y0"]
+                break
+        else:
+            # nearest page
+            if self.page_layout:
+                pl = min(self.page_layout, key=lambda p: abs((p["y0"] + p["y1"]) / 2 - y))
+                page_idx = pl["idx"]
+                local_y = y - pl["y0"]
+        self.current_page = page_idx
+        try:
+            self.page_var.set(str(page_idx + 1))
+        except Exception:
+            pass
+        return fitz.Point(x / self.zoom, local_y / self.zoom)
 
     def _on_canvas_click(self, event):
         if not self.pdf.doc:
@@ -2810,20 +2938,55 @@ class OnePDFEditor(tk.Tk):
             messagebox.showinfo("No file", "Open a file first.", parent=self)
             return
         try:
-            import tempfile
             tmp = Path(tempfile.gettempdir()) / f"OnePDF_print_{os.getpid()}.pdf"
-            # Write a print copy without mutating user path state incorrectly
             self.pdf.doc.save(str(tmp), garbage=1, deflate=True)
             path = str(tmp)
-            if sys.platform.startswith("win"):
+            if not sys.platform.startswith("win"):
+                messagebox.showinfo("Print", f"Saved print copy to:\n{path}", parent=self)
+                return
+            opened = False
+            # 1) ShellExecute Print verb
+            try:
+                import ctypes
+                rc = ctypes.windll.shell32.ShellExecuteW(
+                    None, "print", path, None, None, 1
+                )
+                if rc > 32:
+                    opened = True
+            except Exception:
+                pass
+            # 2) PowerShell Start-Process -Verb Print
+            if not opened:
+                try:
+                    import subprocess
+                    subprocess.Popen(
+                        [
+                            "powershell",
+                            "-NoProfile",
+                            "-Command",
+                            f'Start-Process -FilePath "{path}" -Verb Print',
+                        ],
+                        shell=False,
+                    )
+                    opened = True
+                except Exception:
+                    pass
+            # 3) os.startfile print
+            if not opened:
                 try:
                     os.startfile(path, "print")
+                    opened = True
                 except Exception:
-                    # Fallback: open with default app so user can print
+                    pass
+            # 4) open file so user can print from viewer
+            if not opened:
+                try:
                     os.startfile(path)
-                self.status.config(text="Print dialog opened")
-            else:
-                messagebox.showinfo("Print", f"Saved print copy to:\n{path}", parent=self)
+                    opened = True
+                except Exception as e:
+                    messagebox.showerror("Print failed", str(e), parent=self)
+                    return
+            self.status.config(text="Print dialog requested — choose printer in Windows")
         except Exception as e:
             messagebox.showerror("Print failed", str(e), parent=self)
 
