@@ -588,6 +588,63 @@ class PDFDocument:
         except Exception:
             return False
 
+    def move_span(self, page_idx, span, dx, dy):
+        """Move text span by (dx, dy) in page coordinates. Keeps text/size/color."""
+        page = self.get_page(page_idx)
+        if not page or not span:
+            return False, "Invalid"
+        if abs(dx) < 0.5 and abs(dy) < 0.5:
+            return False, "No move"
+        self.save_state()
+        bbox = fitz.Rect(span["bbox"])
+        origin = fitz.Point(span["origin"])
+        text = span.get("text") or ""
+        if not text.strip():
+            return False, "Empty"
+        fontsize = float(span.get("size") or 11)
+        color = safe_color_to_rgb(span.get("color", 0))
+        flags = span.get("flags", 0)
+        bold = bool(flags & 16)
+        is_bn = text_has_bengali(text)
+        fontfile = get_bengali_font_path(bold=bold) if is_bn else None
+        fontname = choose_fallback_font(span.get("font", "helv"), flags, text)
+        try:
+            _ = fitz.Font(fontname)
+        except Exception:
+            fontname = "helv"
+        # Sample background from corners/edges (avoid center text ink)
+        bg_fill = self.sample_rect_background(page_idx, bbox)
+        try:
+            # Slightly pad redact so no leftover glyph edges
+            pad = fitz.Rect(bbox.x0 - 0.5, bbox.y0 - 0.5, bbox.x1 + 0.5, bbox.y1 + 0.5)
+            page.add_redact_annot(pad, fill=bg_fill)
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                text=fitz.PDF_REDACT_TEXT_REMOVE,
+            )
+            # Paint solid bg rect so hole matches page
+            shape = page.new_shape()
+            shape.draw_rect(pad)
+            shape.finish(color=bg_fill, fill=bg_fill, width=0)
+            shape.commit()
+            new_origin = fitz.Point(origin.x + dx, origin.y + dy)
+            if fontfile:
+                try:
+                    page.insert_font(fontname="bnfont", fontfile=fontfile)
+                    page.insert_text(new_origin, text, fontname="bnfont", fontfile=fontfile,
+                                     fontsize=fontsize, color=color, overlay=True)
+                except Exception:
+                    page.insert_text(new_origin, text, fontname=fontname, fontsize=fontsize,
+                                     color=color, overlay=True)
+            else:
+                page.insert_text(new_origin, text, fontname=fontname, fontsize=fontsize,
+                                 color=color, overlay=True)
+            self.dirty = True
+            return True, "Moved"
+        except Exception as e:
+            return False, str(e)
+
     def insert_text_in_rect(self, page_idx, rect, text, fontsize=None, color=(0, 0, 0)):
         page = self.get_page(page_idx)
         if not page or not text:
@@ -940,6 +997,11 @@ class OnePDFEditor(tk.Tk):
         self.highlight_rect = None
         self.selected_span = None
         self.selected_page = -1
+        self._move_active = False
+        self.placing_symbol = False
+        self.symbol_char = None
+        self._move_delta = (0.0, 0.0)
+        self._move_start = None
         self.signature_img = None
         self.sig_rect = None
         self.placing_signature = False
@@ -1045,6 +1107,31 @@ class OnePDFEditor(tk.Tk):
         tools_m.add_command(label="Set as Default PDF Viewer...", command=self.show_default_viewer_help)
 
         help_m = tk.Menu(menubar, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"], activebackground=COLORS["accent"])
+        sym_m = tk.Menu(menubar, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"], activebackground=COLORS["accent"])
+        menubar.add_cascade(label="Symbols", menu=sym_m)
+        for lab, ch in [
+            ("✓  Check mark", "✓"),
+            ("✔  Heavy check", "✔"),
+            ("☑  Ballot box check", "☑"),
+            ("☐  Empty box", "☐"),
+            ("✗  Cross", "✗"),
+            ("★  Star", "★"),
+            ("•  Bullet", "•"),
+            ("→  Arrow", "→"),
+            ("©  Copyright", "©"),
+            ("®  Registered", "®"),
+            ("°  Degree", "°"),
+            ("§  Section", "§"),
+            ("—  Em dash", "—"),
+            ("€  Euro", "€"),
+            ("£  Pound", "£"),
+            ("₹  Rupee", "₹"),
+            ("™  Trademark", "™"),
+            ("∞  Infinity", "∞"),
+            ("≈  Approx", "≈"),
+            ("±  Plus-minus", "±"),
+        ]:
+            sym_m.add_command(label=lab, command=lambda c=ch: self.start_place_symbol(c))
         menubar.add_cascade(label="Help", menu=help_m)
         help_m.add_command(label="About", command=self.show_about)
 
@@ -1055,9 +1142,11 @@ class OnePDFEditor(tk.Tk):
         inner.pack(side=tk.LEFT, padx=8, pady=6)
         for text, cmd in [("Open", self.open_file), ("Save", self.save_pdf), ("Save As", self.save_as_pdf)]:
             self._make_tool_btn(inner, text, cmd).pack(side=tk.LEFT, padx=3)
+        self._make_tool_btn(inner, "🖨 Print", self.print_document).pack(side=tk.LEFT, padx=3)
         tk.Frame(inner, width=12, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
         for text, cmd in [("Undo", self.undo), ("Search", self.show_search)]:
             self._make_tool_btn(inner, text, cmd).pack(side=tk.LEFT, padx=3)
+        self._make_tool_btn(inner, "✓", lambda: self.start_place_symbol("✓")).pack(side=tk.LEFT, padx=3)
         tk.Frame(inner, width=8, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
         for text, cmd in [("Sign", self.start_signature), ("Copy Sign", self.start_copy_sign_region),
                           ("Fill Box", self.start_fill_box), ("Screenshot", self.take_screenshot)]:
@@ -1129,6 +1218,8 @@ class OnePDFEditor(tk.Tk):
 
     def _bind_shortcuts(self):
         self.bind("<Control-o>", lambda e: self.open_file())
+        self.bind("<Control-p>", lambda e: self.print_document())
+        self.bind("<Control-P>", lambda e: self.print_document())
         self.bind("<Control-s>", lambda e: self.save_pdf())
         self.bind("<Control-S>", lambda e: self.save_as_pdf())
         self.bind("<Control-Shift-S>", lambda e: self.save_as_pdf())
@@ -1350,8 +1441,16 @@ class OnePDFEditor(tk.Tk):
                 r = self.highlight_rect * self.zoom
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#fbbf24", width=2, tags="highlight")
             if self.selected_span and self.selected_page == self.current_page:
-                r = self.selected_span["bbox"] * self.zoom
+                r = fitz.Rect(self.selected_span["bbox"])
+                if self._move_active and self._move_delta:
+                    r = fitz.Rect(r.x0 + self._move_delta[0], r.y0 + self._move_delta[1],
+                                  r.x1 + self._move_delta[0], r.y1 + self._move_delta[1])
+                r = r * self.zoom
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#4ade80", width=2, tags="selected")
+                # ghost label while dragging
+                if self._move_active and (abs(self._move_delta[0]) > 0.5 or abs(self._move_delta[1]) > 0.5):
+                    self.canvas.create_text(r.x0, max(0, r.y0 - 12), text="↕ move",
+                                            fill="#4ade80", font=("Segoe UI", 8), anchor=tk.NW, tags="selected")
             if self.placing_signature and self.sig_rect:
                 r = self.sig_rect * self.zoom
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#7c5cff", width=2, dash=(4, 2), tags="sigpreview")
@@ -1387,6 +1486,11 @@ class OnePDFEditor(tk.Tk):
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         pt = self._canvas_to_pdf(cx, cy)
+
+        # Place symbol
+        if self.placing_symbol and self.symbol_char:
+            self._place_symbol_at(pt)
+            return
 
         # Color picker mode
         if self.pick_color_mode:
@@ -1424,10 +1528,25 @@ class OnePDFEditor(tk.Tk):
         if hit:
             self.selected_span = hit
             self.selected_page = self.current_page
-            self.status.config(text=f'Selected: "{hit["text"][:50]}"  —  Double-click to edit in place')
+            self._move_active = True
+            self._move_start = pt
+            self._move_delta = (0.0, 0.0)
+            self._drag_start = pt
+            self.status.config(text=f'Selected: "{hit["text"][:40]}"  —  Drag to move · Double-click to edit')
+            try:
+                self.canvas.config(cursor="fleur")
+            except Exception:
+                pass
             self.render_page()
         else:
             self.selected_span = None
+            self._move_active = False
+            self._move_start = None
+            self._move_delta = (0.0, 0.0)
+            try:
+                self.canvas.config(cursor="")
+            except Exception:
+                pass
             self.render_page()
 
     def _on_double_click(self, event):
@@ -1557,11 +1676,17 @@ class OnePDFEditor(tk.Tk):
             pass
 
     def _on_canvas_drag(self, event):
-        if not self._drag_start:
-            return
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         pt = self._canvas_to_pdf(cx, cy)
+        # Move selected text
+        if self._move_active and self.selected_span and self._move_start is not None:
+            if not (self.screenshot_mode or self.fill_mode or self.copy_sign_mode or self.placing_signature):
+                self._move_delta = (pt.x - self._move_start.x, pt.y - self._move_start.y)
+                self.render_page()
+                return
+        if not self._drag_start:
+            return
         if self.screenshot_mode:
             self.screenshot_rect = fitz.Rect(self._drag_start, pt)
             self.screenshot_rect.normalize()
@@ -1583,6 +1708,32 @@ class OnePDFEditor(tk.Tk):
             self.render_page()
 
     def _on_canvas_release(self, event):
+        # Finish text move
+        if self._move_active and self.selected_span and self._move_start is not None:
+            dx, dy = self._move_delta
+            self._move_active = False
+            self._move_start = None
+            self._drag_start = None
+            try:
+                self.canvas.config(cursor="")
+            except Exception:
+                pass
+            if abs(dx) >= 1.0 or abs(dy) >= 1.0:
+                span = self.selected_span
+                page = self.selected_page
+                ok, msg = self.pdf.move_span(page, span, dx, dy)
+                self._move_delta = (0.0, 0.0)
+                self.selected_span = None
+                if ok:
+                    self.render_page()
+                    self.status.config(text="Text moved — click to select again")
+                else:
+                    self.status.config(text=f"Move: {msg}")
+                    self.render_page()
+            else:
+                self._move_delta = (0.0, 0.0)
+                self.render_page()
+            return
         if self.screenshot_mode and self.screenshot_rect:
             self._screenshot_selected_area()
             return
@@ -1765,6 +1916,8 @@ class OnePDFEditor(tk.Tk):
         self.pick_color_mode = False
         self.copy_sign_mode = False
         self.screenshot_mode = False
+        self.placing_symbol = False
+        self.symbol_char = None
         self.fill_rect = None
         self.copy_sign_rect = None
         self.screenshot_rect = None
@@ -2313,6 +2466,82 @@ class OnePDFEditor(tk.Tk):
                 messagebox.showinfo("Text", buf["text"] or "(empty)", parent=self)
 
         BanglaKeyboard(self, on_char=insert_char, on_enter=on_enter)
+
+
+    def print_document(self):
+        """Open Windows print dialog for the current PDF."""
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a file first.", parent=self)
+            return
+        try:
+            import tempfile
+            tmp = Path(tempfile.gettempdir()) / f"OnePDF_print_{os.getpid()}.pdf"
+            # Write a print copy without mutating user path state incorrectly
+            self.pdf.doc.save(str(tmp), garbage=1, deflate=True)
+            path = str(tmp)
+            if sys.platform.startswith("win"):
+                try:
+                    os.startfile(path, "print")
+                except Exception:
+                    # Fallback: open with default app so user can print
+                    os.startfile(path)
+                self.status.config(text="Print dialog opened")
+            else:
+                messagebox.showinfo("Print", f"Saved print copy to:\n{path}", parent=self)
+        except Exception as e:
+            messagebox.showerror("Print failed", str(e), parent=self)
+
+    def start_place_symbol(self, char):
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a file first.", parent=self)
+            return
+        self.placing_symbol = True
+        self.symbol_char = char
+        self.fill_mode = False
+        self.screenshot_mode = False
+        self.copy_sign_mode = False
+        self.placing_signature = False
+        self._move_active = False
+        try:
+            self.canvas.config(cursor="crosshair")
+        except Exception:
+            pass
+        self.status.config(text=f"Symbol '{char}' — click on the page to place it")
+
+    def _place_symbol_at(self, pt):
+        char = self.symbol_char or "✓"
+        self.placing_symbol = False
+        self.symbol_char = None
+        try:
+            self.canvas.config(cursor="")
+        except Exception:
+            pass
+        page = self.pdf.get_page(self.current_page)
+        if not page:
+            return
+        self.pdf.save_state()
+        try:
+            # Prefer a Unicode-capable font if available (Bangla pack covers many symbols poorly;
+            # use built-in or Noto if needed). Helvetica misses many symbols — try fontfile.
+            fontfile = get_bengali_font_path()
+            fontsize = 14
+            origin = fitz.Point(pt.x, pt.y)
+            if fontfile:
+                try:
+                    page.insert_font(fontname="symfont", fontfile=fontfile)
+                    page.insert_text(origin, char, fontname="symfont", fontfile=fontfile,
+                                     fontsize=fontsize, color=self.text_color, overlay=True)
+                except Exception:
+                    page.insert_text(origin, char, fontname="helv", fontsize=fontsize,
+                                     color=self.text_color, overlay=True)
+            else:
+                page.insert_text(origin, char, fontname="helv", fontsize=fontsize,
+                                 color=self.text_color, overlay=True)
+            self.pdf.dirty = True
+            self.render_page()
+            self.status.config(text=f"Symbol placed: {char}")
+        except Exception as e:
+            messagebox.showerror("Symbol", str(e), parent=self)
 
     def show_about(self):
         messagebox.showinfo(
