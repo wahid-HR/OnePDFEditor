@@ -146,9 +146,13 @@ _BIJOY_MAP = {
 }
 
 
-def bijoy_to_unicode(text):
-    """Best-effort Bijoy→Unicode. If already Unicode Bangla, return as-is."""
+def bijoy_to_unicode(text, force=False):
+    """Best-effort Bijoy→Unicode. Only when force=True (user chose Bijoy mode).
+    Never auto-convert normal English text.
+    """
     if text_has_bengali(text):
+        return text
+    if not force:
         return text
     out = []
     for ch in text:
@@ -454,9 +458,8 @@ class PDFDocument:
             )
         except Exception as e:
             return False, f"Redaction failed: {e}"
-        # Convert Bijoy-style input to Unicode if needed
-        new_text = bijoy_to_unicode(new_text)
-        is_bn = text_has_bengali(new_text) or text_needs_complex_script(new_text)
+        # Do NOT auto-convert English to Bangla. Use Bangla font only if text has Bangla letters.
+        is_bn = text_has_bengali(new_text)
         fontfile = get_bengali_font_path(bold=bold) if is_bn else None
 
         try:
@@ -597,7 +600,6 @@ class PDFDocument:
             return False
         self.save_state()
         try:
-            text = bijoy_to_unicode(text)
             r = fitz.Rect(rect)
             if fontsize is None:
                 fontsize = max(6.0, min(24.0, r.height * 0.65))
