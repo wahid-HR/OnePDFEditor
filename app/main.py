@@ -2091,7 +2091,7 @@ class OnePDFEditor(tk.Tk):
             iw, ih = im.size
             scale = max(cw / max(iw, 1), ch / max(ih, 1))
             nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
-            im = im.resize((nw, nh), Image.Resampling.BILINEAR)
+            im = im.resize((nw, nh), Image.Resampling.LANCZOS)
             left = max(0, (nw - cw) // 2)
             top = max(0, (nh - ch) // 2)
             im = im.crop((left, top, left + cw, top + ch))
@@ -2116,21 +2116,21 @@ class OnePDFEditor(tk.Tk):
         # Transparent text only
         cx, cy = cw // 2, ch // 2
         line1, line2 = "Drag & Drop", "your file here"
-        for dx, dy in ((1, 1), (0, 1)):
-            self.canvas.create_text(cx + dx, cy - 18 + dy, text=line1, fill="#000000",
-                                    font=("Segoe UI", 28, "bold"), tags="dash")
-            self.canvas.create_text(cx + dx, cy + 22 + dy, text=line2, fill="#000000",
-                                    font=("Segoe UI", 16), tags="dash")
-        self.canvas.create_text(cx, cy - 18, text=line1, fill="#1a1a1a",
-                                font=("Segoe UI", 28, "bold"), tags="dash")
-        self.canvas.create_text(cx, cy + 22, text=line2, fill="#1a1a1a",
-                                font=("Segoe UI", 16), tags="dash")
+        for dx, dy in ((1, 1),):
+            self.canvas.create_text(cx + dx, cy - 10 + dy, text=line1, fill="#000000",
+                                    font=("Segoe UI", 15, "bold"), tags="dash")
+            self.canvas.create_text(cx + dx, cy + 12 + dy, text=line2, fill="#000000",
+                                    font=("Segoe UI", 11), tags="dash")
+        self.canvas.create_text(cx, cy - 10, text=line1, fill="#1a1a1a",
+                                font=("Segoe UI", 15, "bold"), tags="dash")
+        self.canvas.create_text(cx, cy + 12, text=line2, fill="#1a1a1a",
+                                font=("Segoe UI", 11), tags="dash")
 
     def _schedule_dashboard_cycle(self):
         self._stop_dashboard(cancel_only=True)
         # ~12 fps to match source video
         if not self.pdf.doc and self._dash_photos:
-            self._dash_job = self.after(83, self._cycle_dashboard)
+            self._dash_job = self.after(125, self._cycle_dashboard)
 
     def _cycle_dashboard(self):
         self._dash_job = None
