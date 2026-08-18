@@ -1310,6 +1310,18 @@ class PDFMergerWindow(tk.Toplevel):
             messagebox.showerror("Merge failed", str(e), parent=self)
 
 
+class TabSession:
+    """One open document tab (max 6)."""
+    def __init__(self, title="Home"):
+        self.pdf = PDFDocument()
+        self.current_page = 0
+        self.zoom = DEFAULT_ZOOM
+        self.title = title
+        self.highlight_rect = None
+        self.selected_span = None
+        self.selected_page = -1
+
+
 class OnePDFEditor(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1318,6 +1330,9 @@ class OnePDFEditor(tk.Tk):
         self.minsize(900, 600)
         self.configure(bg=COLORS["bg"])
         self._set_app_icon()
+        self.MAX_TABS = 6
+        self.tabs = []  # list[TabSession]
+        self.active_tab = -1
         self.pdf = PDFDocument()
         self.current_page = 0
         self.zoom = DEFAULT_ZOOM
@@ -1503,6 +1518,13 @@ class OnePDFEditor(tk.Tk):
         self._make_tool_btn(inner, "+", lambda: self.set_zoom(self.zoom * 1.25)).pack(side=tk.LEFT)
         self._make_tool_btn(inner, "Fit", self.fit_page).pack(side=tk.LEFT, padx=4)
 
+        # Tab bar (up to 6 open files)
+        self.tab_bar = tk.Frame(self, bg=COLORS["surface"], height=34)
+        self.tab_bar.pack(side=tk.TOP, fill=tk.X)
+        self.tab_bar.pack_propagate(False)
+        self._tab_buttons = []
+        self._refresh_tab_bar()
+
         self.drop_hint = tk.Label(self, text="  Open PDF / Image / Word file  •  Double-click text to edit in place",
                                   bg=COLORS["surface2"], fg=COLORS["text_dim"], font=("Segoe UI", 10), pady=8)
         self.drop_hint.pack(side=tk.TOP, fill=tk.X)
@@ -1553,6 +1575,8 @@ class OnePDFEditor(tk.Tk):
     def _bind_shortcuts(self):
         self.bind("<Control-o>", lambda e: self.open_file())
         self.bind("<Control-p>", lambda e: self.print_document())
+        self.bind("<Control-w>", lambda e: self.close_tab())
+        self.bind("<Control-W>", lambda e: self.close_tab())
         self.bind("<Control-P>", lambda e: self.print_document())
         self.bind("<Control-s>", lambda e: self.save_pdf())
         self.bind("<Control-S>", lambda e: self.save_as_pdf())
@@ -1569,10 +1593,194 @@ class OnePDFEditor(tk.Tk):
         self.bind("<Up>", lambda e: self.prev_page())
         self.bind("<Down>", lambda e: self.next_page())
 
-    def open_file(self):
-        if self.pdf.dirty:
-            if not messagebox.askyesno("Unsaved", "Discard unsaved changes?"):
+
+    def _push_ui_to_tab(self):
+        if self.active_tab < 0 or self.active_tab >= len(self.tabs):
+            return
+        t = self.tabs[self.active_tab]
+        t.pdf = self.pdf
+        t.current_page = self.current_page
+        t.zoom = self.zoom
+        t.highlight_rect = self.highlight_rect
+        t.selected_span = self.selected_span
+        t.selected_page = self.selected_page
+        if self.pdf.path:
+            t.title = os.path.basename(self.pdf.path)
+        elif self.pdf.doc:
+            t.title = t.title or "Untitled"
+
+    def _pull_tab_to_ui(self):
+        if self.active_tab < 0 or self.active_tab >= len(self.tabs):
+            self.pdf = PDFDocument()
+            self.current_page = 0
+            self.zoom = DEFAULT_ZOOM
+            self.highlight_rect = None
+            self.selected_span = None
+            self.selected_page = -1
+            return
+        t = self.tabs[self.active_tab]
+        self.pdf = t.pdf
+        self.current_page = t.current_page
+        self.zoom = t.zoom
+        self.highlight_rect = t.highlight_rect
+        self.selected_span = t.selected_span
+        self.selected_page = t.selected_page
+        try:
+            self.zoom_lbl.config(text=f"{int(self.zoom * 100)}%")
+        except Exception:
+            pass
+
+    def _refresh_tab_bar(self):
+        for w in getattr(self, "_tab_buttons", []):
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._tab_buttons = []
+        if not hasattr(self, "tab_bar"):
+            return
+        for i, t in enumerate(self.tabs):
+            active = i == self.active_tab
+            bg = COLORS["accent"] if active else COLORS["surface2"]
+            fg = "white" if active else COLORS["text"]
+            name = t.title or "Untitled"
+            if len(name) > 18:
+                name = name[:15] + "…"
+            dirty = " •" if getattr(t.pdf, "dirty", False) else ""
+            fr = tk.Frame(self.tab_bar, bg=bg)
+            fr.pack(side=tk.LEFT, padx=(4, 0), pady=4)
+            btn = tk.Button(
+                fr, text=f"{name}{dirty}", command=lambda idx=i: self.switch_tab(idx),
+                bg=bg, fg=fg, relief=tk.FLAT, font=("Segoe UI", 9),
+                padx=10, pady=2, cursor="hand2", activebackground=COLORS["accent_hover"],
+            )
+            btn.pack(side=tk.LEFT)
+            close = tk.Button(
+                fr, text="×", command=lambda idx=i: self.close_tab(idx),
+                bg=bg, fg=fg, relief=tk.FLAT, font=("Segoe UI", 10, "bold"),
+                padx=6, pady=2, cursor="hand2", activebackground="#ef4444",
+            )
+            close.pack(side=tk.LEFT)
+            self._tab_buttons.extend([fr, btn, close])
+        # New tab hint when under max
+        if len(self.tabs) < self.MAX_TABS:
+            add = tk.Button(
+                self.tab_bar, text="+", command=self.open_file,
+                bg=COLORS["surface"], fg=COLORS["text_dim"], relief=tk.FLAT,
+                font=("Segoe UI", 12, "bold"), padx=8, cursor="hand2",
+            )
+            add.pack(side=tk.LEFT, padx=4, pady=4)
+            self._tab_buttons.append(add)
+        if not self.tabs:
+            empty = tk.Label(
+                self.tab_bar, text="  No files open — Open or drag a file (max 6 tabs)",
+                bg=COLORS["surface"], fg=COLORS["text_dim"], font=("Segoe UI", 9),
+            )
+            empty.pack(side=tk.LEFT, padx=8)
+            self._tab_buttons.append(empty)
+
+    def switch_tab(self, idx):
+        if idx < 0 or idx >= len(self.tabs):
+            return
+        if idx == self.active_tab:
+            return
+        self._cancel_ops()
+        self._push_ui_to_tab()
+        self.active_tab = idx
+        self._pull_tab_to_ui()
+        self._refresh_tab_bar()
+        self._update_page_ui()
+        self.render_page()
+        if self.pdf.doc:
+            try:
+                self.drop_hint.pack_forget()
+            except Exception:
+                pass
+            self.status.config(text=f"Tab {idx + 1}: {self.tabs[idx].title}")
+        else:
+            self.status.config(text="Empty tab")
+
+    def close_tab(self, idx=None):
+        if idx is None:
+            idx = self.active_tab
+        if idx < 0 or idx >= len(self.tabs):
+            return
+        t = self.tabs[idx]
+        if t.pdf.dirty:
+            if not messagebox.askyesno("Unsaved", f'"{t.title}" has unsaved changes. Close anyway?', parent=self):
                 return
+        try:
+            t.pdf.close()
+        except Exception:
+            pass
+        was_active = (idx == self.active_tab)
+        self.tabs.pop(idx)
+        if not self.tabs:
+            self.active_tab = -1
+            self.pdf = PDFDocument()
+            self.current_page = 0
+            self.zoom = DEFAULT_ZOOM
+            self.highlight_rect = None
+            self.selected_span = None
+            self.selected_page = -1
+            self.page_layout = []
+            self.photos = []
+            self._refresh_tab_bar()
+            self._update_page_ui()
+            self.render_page()
+            try:
+                self.drop_hint.pack(side=tk.TOP, fill=tk.X)
+            except Exception:
+                pass
+            self.status.config(text="All tabs closed")
+            return
+        # Adjust active index; never close sibling tabs' documents
+        if was_active:
+            self.active_tab = min(idx, len(self.tabs) - 1)
+            self._pull_tab_to_ui()
+        else:
+            if idx < self.active_tab:
+                self.active_tab -= 1
+            # active document object unchanged
+        self._refresh_tab_bar()
+        self._update_page_ui()
+        self.render_page()
+        self.status.config(text=f"Closed tab · {len(self.tabs)} still open")
+
+    def _open_in_tab(self, path):
+        """Create a NEW tab for path (caller ensures not already open). Max 6."""
+        if len(self.tabs) >= self.MAX_TABS:
+            messagebox.showwarning(
+                "Tab limit",
+                f"Maximum {self.MAX_TABS} tabs open. Close a tab first.",
+                parent=self,
+            )
+            return False
+        self._push_ui_to_tab()
+        title = os.path.basename(path) if path else "Untitled"
+        session = TabSession(title=title)
+        self.tabs.append(session)
+        self.active_tab = len(self.tabs) - 1
+        self.pdf = session.pdf
+        self.current_page = 0
+        self.zoom = DEFAULT_ZOOM
+        self.highlight_rect = None
+        self.selected_span = None
+        self.selected_page = -1
+        self.search_results = []
+        self.search_index = -1
+        return True
+
+
+    def open_file(self):
+        # Multi-tab: opening a new file does NOT close other tabs
+        if len(self.tabs) >= self.MAX_TABS:
+            messagebox.showwarning(
+                "Tab limit",
+                f"Already {self.MAX_TABS} tabs open.\nClose a tab (×) before opening another.",
+                parent=self,
+            )
+            return
         path = filedialog.askopenfilename(
             title="Open File",
             filetypes=[
@@ -1589,33 +1797,59 @@ class OnePDFEditor(tk.Tk):
     def _load_path(self, path):
         try:
             self._stop_dashboard()
+            self._cancel_ops()
+            path = str(path)
+            # Already open in a tab? just switch (do not reload / do not close others)
+            try:
+                resolved = str(Path(path).resolve())
+            except Exception:
+                resolved = path
+            for i, t in enumerate(self.tabs):
+                try:
+                    if t.pdf.path and str(Path(t.pdf.path).resolve()) == resolved and t.pdf.doc:
+                        self.switch_tab(i)
+                        self.status.config(text=f"Switched to open tab: {t.title}")
+                        return
+                except Exception:
+                    pass
+            if not self._open_in_tab(path):
+                return
             ok = self.pdf.open(path)
             if not ok:
-                pwd = simpledialog.askstring("Password", "File is encrypted. Enter password:", show="*")
+                pwd = simpledialog.askstring("Password", "File is encrypted. Enter password:", show="*", parent=self)
                 if pwd is None:
+                    # rollback empty tab
+                    self.close_tab(self.active_tab)
                     return
                 ok = self.pdf.open(path, password=pwd)
                 if not ok:
-                    messagebox.showerror("Error", "Incorrect password or cannot open.")
+                    messagebox.showerror("Error", "Incorrect password or cannot open.", parent=self)
+                    self.close_tab(self.active_tab)
                     return
             self.current_page = 0
             self.zoom = DEFAULT_ZOOM
             self.highlight_rect = None
             self.selected_span = None
-            self._cancel_inline_edit()
+            self._push_ui_to_tab()
+            self._refresh_tab_bar()
             self._update_page_ui()
             self.render_page()
             self.fit_width()
             name = os.path.basename(path)
             kind = self.pdf.source_type.upper()
             n = self.pdf.page_count()
-            self.status.config(text=f"Opened ({kind}): {name}  ·  {n} page(s)  ·  use < > or PageUp/PageDown")
+            self.status.config(text=f"Opened ({kind}): {name}  ·  {n} page(s)  ·  Tab {self.active_tab + 1}/{len(self.tabs)}")
             try:
                 self.drop_hint.pack_forget()
             except Exception:
                 pass
         except Exception as e:
-            messagebox.showerror("Open failed", str(e))
+            messagebox.showerror("Open failed", str(e), parent=self)
+            try:
+                if self.active_tab >= 0 and not self.pdf.doc:
+                    self.close_tab(self.active_tab)
+            except Exception:
+                pass
 
     def save_pdf(self):
         if not self.pdf.doc:
