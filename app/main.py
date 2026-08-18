@@ -29,6 +29,97 @@ try:
 except ImportError:
     HAS_DOCX = False
 
+def convert_docx_via_word(path):
+    """Convert .docx to PDF using installed Microsoft Word (best fidelity).
+    Returns path to a temp PDF. Raises on failure.
+    """
+    path = str(Path(path).resolve())
+    if not path.lower().endswith(".docx"):
+        raise RuntimeError("Not a Word file")
+    tmp_pdf = str(Path(tempfile.gettempdir()) / f"onepdf_docx_{os.getpid()}_{abs(hash(path)) % 10**8}.pdf")
+    if os.path.exists(tmp_pdf):
+        try:
+            os.remove(tmp_pdf)
+        except Exception:
+            pass
+    word = None
+    doc = None
+    try:
+        import win32com.client  # type: ignore
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        doc = word.Documents.Open(path, ReadOnly=True)
+        # 17 = wdFormatPDF
+        doc.SaveAs(tmp_pdf, FileFormat=17)
+        doc.Close(False)
+        doc = None
+        word.Quit()
+        word = None
+        if not os.path.isfile(tmp_pdf):
+            raise RuntimeError("Word did not produce a PDF")
+        return tmp_pdf
+    except Exception as e:
+        try:
+            if doc is not None:
+                doc.Close(False)
+        except Exception:
+            pass
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:
+            pass
+        raise RuntimeError(
+            "High-quality Word→PDF needs Microsoft Word installed.\\n"
+            f"Details: {e}"
+        )
+
+
+def convert_docx_simple(path):
+    """Fallback: paragraphs only (no tables/images/headers)."""
+    if not HAS_DOCX:
+        raise RuntimeError("python-docx not available")
+    document = DocxDocument(path)
+    pdf = fitz.open()
+    page = pdf.new_page(width=595, height=842)
+    y = 50
+    for para in document.paragraphs:
+        text = (para.text or "").strip()
+        if not text:
+            y += 8
+            continue
+        while text:
+            chunk = text[:90]
+            text = text[90:]
+            if y > 800:
+                page = pdf.new_page(width=595, height=842)
+                y = 50
+            page.insert_text((50, y), chunk, fontsize=11, fontname="helv")
+            y += 16
+    return pdf
+
+
+def docx_to_fitz(path):
+    """Prefer MS Word COM (keeps tables/images/headers); else simple text PDF."""
+    if sys.platform.startswith("win"):
+        try:
+            pdf_path = convert_docx_via_word(path)
+            doc = fitz.open(pdf_path)
+            # load into memory so temp can be deleted
+            data = doc.tobytes()
+            page_count = doc.page_count
+            doc.close()
+            try:
+                os.remove(pdf_path)
+            except Exception:
+                pass
+            return fitz.open("pdf", data)
+        except Exception:
+            pass
+    return convert_docx_simple(path)
+
+
 APP_NAME = "One PDF Editor"
 APP_VERSION = "1.0"
 APP_YEAR = "2026"
@@ -243,26 +334,7 @@ class PDFDocument:
         return True
 
     def _open_docx(self, path):
-        if not HAS_DOCX:
-            raise RuntimeError("Word support requires python-docx")
-        document = DocxDocument(path)
-        pdf = fitz.open()
-        page = pdf.new_page(width=595, height=842)
-        y = 50
-        for para in document.paragraphs:
-            text = para.text.strip()
-            if not text:
-                y += 12
-                continue
-            while text and y < 800:
-                chunk = text[:90]
-                text = text[90:]
-                page.insert_text((50, y), chunk, fontsize=11, fontname="helv")
-                y += 16
-            if y >= 800:
-                page = pdf.new_page(width=595, height=842)
-                y = 50
-        self.doc = pdf
+        self.doc = docx_to_fitz(path)
         self.path = path
         self.source_type = "docx"
         self.dirty = True
@@ -980,6 +1052,264 @@ def phonetic_bangla(text):
     return "".join(out)
 
 
+
+class PDFMergerWindow(tk.Toplevel):
+    """Merge multiple PDFs with order preview and Save As."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_app = parent
+        self.title("PDF Merger — One PDF Editor")
+        self.configure(bg=COLORS["surface"])
+        self.geometry("780x520")
+        self.minsize(640, 420)
+        self.transient(parent)
+        self.files = []  # list of {"path", "pages", "name"}
+        self._thumb = None
+        self._build()
+
+    def _build(self):
+        top = tk.Frame(self, bg=COLORS["surface"])
+        top.pack(fill=tk.X, padx=12, pady=10)
+        tk.Label(top, text="PDF Merger", bg=COLORS["surface"], fg=COLORS["text"],
+                 font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
+        tk.Label(top, text="PDF · Image · Word → auto PDF · reorder · Merge", bg=COLORS["surface"],
+                 fg=COLORS["text_dim"], font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=12)
+
+        body = tk.Frame(self, bg=COLORS["surface"])
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+
+        left = tk.Frame(body, bg=COLORS["surface"])
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Label(left, text="Merge order (top = first)", bg=COLORS["surface"],
+                 fg=COLORS["text_dim"], font=("Segoe UI", 9)).pack(anchor=tk.W)
+        lf = tk.Frame(left, bg=COLORS["surface2"])
+        lf.pack(fill=tk.BOTH, expand=True, pady=4)
+        self.listbox = tk.Listbox(
+            lf, bg=COLORS["surface2"], fg=COLORS["text"], selectbackground=COLORS["accent"],
+            font=("Segoe UI", 10), relief=tk.FLAT, activestyle="none",
+            highlightthickness=0,
+        )
+        sb = tk.Scrollbar(lf, command=self.listbox.yview)
+        self.listbox.config(yscrollcommand=sb.set)
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+
+        btns = tk.Frame(left, bg=COLORS["surface"])
+        btns.pack(fill=tk.X, pady=6)
+        for text, cmd in [
+            ("+ Add files", self.add_files),
+            ("↑ Up", self.move_up),
+            ("↓ Down", self.move_down),
+            ("Remove", self.remove_selected),
+            ("Clear", self.clear_all),
+        ]:
+            tk.Button(
+                btns, text=text, command=cmd, bg=COLORS["surface2"], fg=COLORS["text"],
+                relief=tk.FLAT, padx=8, pady=4, font=("Segoe UI", 9), cursor="hand2",
+            ).pack(side=tk.LEFT, padx=3)
+
+        right = tk.Frame(body, bg=COLORS["surface"], width=260)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        right.pack_propagate(False)
+        tk.Label(right, text="Preview", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Segoe UI", 9)).pack(anchor=tk.W)
+        self.preview_lbl = tk.Label(right, bg="#0b1220", text="No file selected",
+                                    fg=COLORS["text_dim"], font=("Segoe UI", 9))
+        self.preview_lbl.pack(fill=tk.BOTH, expand=True, pady=4)
+        self.info_lbl = tk.Label(right, text="", bg=COLORS["surface"], fg=COLORS["text"],
+                                 font=("Segoe UI", 9), justify=tk.LEFT, wraplength=240)
+        self.info_lbl.pack(anchor=tk.W, pady=4)
+
+        bottom = tk.Frame(self, bg=COLORS["surface"])
+        bottom.pack(fill=tk.X, padx=12, pady=12)
+        self.status = tk.Label(bottom, text="Add PDF / Image / Word files", bg=COLORS["surface"],
+                               fg=COLORS["text_dim"], font=("Segoe UI", 9))
+        self.status.pack(side=tk.LEFT)
+        tk.Button(
+            bottom, text="Merge & Save As…", command=self.merge_and_save,
+            bg=COLORS["accent"], fg="white", relief=tk.FLAT, padx=16, pady=8,
+            font=("Segoe UI", 10, "bold"), cursor="hand2",
+        ).pack(side=tk.RIGHT)
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(
+            parent=self,
+            title="Add PDF / Image / Word files",
+            filetypes=[
+                ("All supported", "*.pdf;*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.docx"),
+                ("PDF", "*.pdf"),
+                ("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"),
+                ("Word", "*.docx"),
+                ("All files", "*.*"),
+            ],
+        )
+        for path in paths:
+            try:
+                kind, pages = self._probe_file(path)
+                self.files.append({
+                    "path": path,
+                    "pages": pages,
+                    "name": os.path.basename(path),
+                    "kind": kind,
+                })
+            except Exception as e:
+                messagebox.showerror("Cannot add", f"{path}\n{e}", parent=self)
+        self._refresh_list()
+        self.status.config(text=f"{len(self.files)} file(s) ready (PDF/Image/Word → PDF on merge)")
+
+    def _probe_file(self, path):
+        ext = Path(path).suffix.lower()
+        if ext == ".pdf":
+            doc = fitz.open(path)
+            n = doc.page_count
+            doc.close()
+            return "PDF", n
+        if ext in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"):
+            return "Image", 1
+        if ext == ".docx":
+            if not HAS_DOCX:
+                raise RuntimeError("Word support requires python-docx")
+            return "Word", 1
+        raise RuntimeError(f"Unsupported file type: {ext}")
+
+    def _open_as_pdf_doc(self, path):
+        """Open any supported file as a fitz PDF document (caller must close)."""
+        ext = Path(path).suffix.lower()
+        if ext == ".pdf":
+            return fitz.open(path)
+        if ext in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"):
+            img = Image.open(path)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            bio = io.BytesIO()
+            img.save(bio, format="PDF", resolution=150.0)
+            bio.seek(0)
+            return fitz.open("pdf", bio.read())
+        if ext == ".docx":
+            return docx_to_fitz(path)
+        raise RuntimeError(f"Unsupported: {ext}")
+
+    def _refresh_list(self):
+        self.listbox.delete(0, tk.END)
+        for i, f in enumerate(self.files, 1):
+            kind = f.get("kind", "PDF")
+            self.listbox.insert(tk.END, f"{i}. [{kind}]  {f['name']}  ({f['pages']} page{'s' if f['pages']!=1 else ''})")
+        if self.files:
+            self.listbox.selection_set(0)
+            self._on_select()
+
+    def _selected_index(self):
+        sel = self.listbox.curselection()
+        return int(sel[0]) if sel else None
+
+    def move_up(self):
+        i = self._selected_index()
+        if i is None or i <= 0:
+            return
+        self.files[i - 1], self.files[i] = self.files[i], self.files[i - 1]
+        self._refresh_list()
+        self.listbox.selection_clear(0, tk.END)
+        self.listbox.selection_set(i - 1)
+        self._on_select()
+
+    def move_down(self):
+        i = self._selected_index()
+        if i is None or i >= len(self.files) - 1:
+            return
+        self.files[i + 1], self.files[i] = self.files[i], self.files[i + 1]
+        self._refresh_list()
+        self.listbox.selection_clear(0, tk.END)
+        self.listbox.selection_set(i + 1)
+        self._on_select()
+
+    def remove_selected(self):
+        i = self._selected_index()
+        if i is None:
+            return
+        self.files.pop(i)
+        self._refresh_list()
+        self.preview_lbl.config(image="", text="No file selected")
+        self._thumb = None
+        self.info_lbl.config(text="")
+        self.status.config(text=f"{len(self.files)} file(s) in list")
+
+    def clear_all(self):
+        self.files.clear()
+        self._refresh_list()
+        self.preview_lbl.config(image="", text="No file selected")
+        self._thumb = None
+        self.info_lbl.config(text="")
+        self.status.config(text="Add 2 or more PDF files")
+
+    def _on_select(self, event=None):
+        i = self._selected_index()
+        if i is None or i >= len(self.files):
+            return
+        f = self.files[i]
+        self.info_lbl.config(
+            text=f"#{i + 1} in order\n[{f.get('kind','PDF')}] {f['name']}\n{f['pages']} page(s)\n(auto→PDF on merge)\n\n{f['path']}"
+        )
+        try:
+            doc = self._open_as_pdf_doc(f["path"])
+            page = doc[0]
+            mat = fitz.Matrix(0.35, 0.35)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            img.thumbnail((240, 300), Image.Resampling.LANCZOS)
+            self._thumb = ImageTk.PhotoImage(img)
+            self.preview_lbl.config(image=self._thumb, text="")
+            doc.close()
+        except Exception as e:
+            self.preview_lbl.config(image="", text=f"Preview failed\n{e}")
+            self._thumb = None
+
+    def merge_and_save(self):
+        if len(self.files) < 1:
+            messagebox.showinfo("Need files", "Add at least one PDF.", parent=self)
+            return
+        if len(self.files) < 2:
+            if not messagebox.askyesno("One file", "Only one PDF in list. Continue anyway?", parent=self):
+                return
+        out = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save merged PDF",
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")],
+            initialfile="merged.pdf",
+            initialdir=str(Path.home() / "Documents"),
+        )
+        if not out:
+            return
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+        try:
+            merged = fitz.open()
+            total_pages = 0
+            for f in self.files:
+                src_doc = self._open_as_pdf_doc(f["path"])
+                merged.insert_pdf(src_doc)
+                total_pages += src_doc.page_count
+                src_doc.close()
+            merged.save(out, garbage=3, deflate=True)
+            merged.close()
+            self.status.config(text=f"Merged {len(self.files)} files → {total_pages} pages")
+            messagebox.showinfo(
+                "Done",
+                f"Merged PDF saved:\n{out}\n\n{len(self.files)} files · {total_pages} pages",
+                parent=self,
+            )
+            if messagebox.askyesno("Open?", "Open the merged PDF in One PDF Editor?", parent=self):
+                try:
+                    self.parent_app._load_path(out)
+                except Exception:
+                    pass
+                self.destroy()
+        except Exception as e:
+            messagebox.showerror("Merge failed", str(e), parent=self)
+
+
 class OnePDFEditor(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1104,6 +1434,8 @@ class OnePDFEditor(tk.Tk):
         tools_m.add_separator()
         tools_m.add_command(label="Screenshot", command=self.take_screenshot)
         tools_m.add_command(label="OCR Image Text...", command=self.ocr_current_page)
+        tools_m.add_separator()
+        tools_m.add_command(label="PDF Merger...", command=self.open_pdf_merger)
         tools_m.add_command(label="Set as Default PDF Viewer...", command=self.show_default_viewer_help)
 
         help_m = tk.Menu(menubar, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"], activebackground=COLORS["accent"])
@@ -1143,6 +1475,7 @@ class OnePDFEditor(tk.Tk):
         for text, cmd in [("Open", self.open_file), ("Save", self.save_pdf), ("Save As", self.save_as_pdf)]:
             self._make_tool_btn(inner, text, cmd).pack(side=tk.LEFT, padx=3)
         self._make_tool_btn(inner, "🖨 Print", self.print_document).pack(side=tk.LEFT, padx=3)
+        self._make_tool_btn(inner, "Merge", self.open_pdf_merger).pack(side=tk.LEFT, padx=3)
         tk.Frame(inner, width=12, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
         for text, cmd in [("Undo", self.undo), ("Search", self.show_search)]:
             self._make_tool_btn(inner, text, cmd).pack(side=tk.LEFT, padx=3)
@@ -2467,6 +2800,9 @@ class OnePDFEditor(tk.Tk):
 
         BanglaKeyboard(self, on_char=insert_char, on_enter=on_enter)
 
+
+    def open_pdf_merger(self):
+        PDFMergerWindow(self)
 
     def print_document(self):
         """Open Windows print dialog for the current PDF."""
