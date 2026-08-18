@@ -1105,8 +1105,8 @@ class OnePDFEditor(tk.Tk):
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         try:
             import windnd
+            # Hook only once on the main window (canvas double-hook can crash)
             windnd.hook_dropfiles(self, func=self._on_windnd_drop)
-            windnd.hook_dropfiles(self.canvas, func=self._on_windnd_drop)
         except Exception:
             pass
         self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
@@ -1163,6 +1163,7 @@ class OnePDFEditor(tk.Tk):
 
     def _load_path(self, path):
         try:
+            self._stop_dashboard()
             ok = self.pdf.open(path)
             if not ok:
                 pwd = simpledialog.askstring("Password", "File is encrypted. Enter password:", show="*")
@@ -2136,13 +2137,13 @@ class OnePDFEditor(tk.Tk):
         self._dash_job = None
         if self.pdf.doc or not self._dash_photos:
             return
-        self._dash_idx = (self._dash_idx + 1) % len(self._dash_photos)
-        # Only redraw frame (fast path)
         try:
+            self._dash_idx = (self._dash_idx + 1) % len(self._dash_photos)
             self._draw_dashboard_frame()
         except Exception:
-            pass
-        self._schedule_dashboard_cycle()
+            return
+        if not self.pdf.doc:
+            self._schedule_dashboard_cycle()
 
     def _stop_dashboard(self, cancel_only=False):
         if self._dash_job is not None:
@@ -2158,12 +2159,10 @@ class OnePDFEditor(tk.Tk):
             data = event.data
         except Exception:
             data = str(event)
-        # tkdnd or windows: {path} or path
         paths = []
         if isinstance(data, str):
             raw = data.strip()
             if raw.startswith("{"):
-                # multiple {a} {b}
                 import re as _re
                 paths = _re.findall(r"\{([^}]+)\}", raw)
                 if not paths:
@@ -2173,26 +2172,64 @@ class OnePDFEditor(tk.Tk):
         for p in paths:
             p = p.strip().strip("{}")
             if os.path.isfile(p):
-                self._load_path(p)
+                self.after(0, lambda path=p: self._safe_load_dropped(path))
                 break
 
+    def _decode_drop_path(self, f):
+        if isinstance(f, bytes):
+            for enc in ("utf-8", "mbcs", "cp1252", "latin-1"):
+                try:
+                    return f.decode(enc).strip("\x00").strip()
+                except Exception:
+                    continue
+            try:
+                return os.fsdecode(f).strip("\x00").strip()
+            except Exception:
+                return f.decode("utf-8", errors="ignore").strip()
+        return str(f).strip("\x00").strip()
+
     def _on_windnd_drop(self, files):
+        # windnd may call from a non-UI thread — always marshal to Tk main loop
         try:
-            for f in files:
-                path = f.decode("utf-8") if isinstance(f, bytes) else str(f)
-                if os.path.isfile(path):
-                    self._load_path(path)
+            path = None
+            for f in (files or []):
+                p = self._decode_drop_path(f)
+                if p and os.path.isfile(p):
+                    path = p
                     break
+            if path:
+                self.after(10, lambda p=path: self._safe_load_dropped(p))
         except Exception as e:
-            self.status.config(text=f"Drop failed: {e}")
+            err = str(e)
+            self.after(0, lambda: self.status.config(text=f"Drop failed: {err}"))
+
+    def _safe_load_dropped(self, path):
+        """Load dropped file safely on the UI thread."""
+        try:
+            self._stop_dashboard()
+            self.screenshot_mode = False
+            self.fill_mode = False
+            self.copy_sign_mode = False
+            self.placing_signature = False
+            self._load_path(path)
+        except Exception as e:
+            try:
+                messagebox.showerror("Open failed", str(e), parent=self)
+            except Exception:
+                pass
 
     def _on_canvas_configure(self, event):
-        if not self.pdf.doc and event.width > 50 and event.height > 50:
-            # invalidate scale cache on resize
+        if self.pdf.doc:
+            return
+        if event.width > 50 and event.height > 50:
             self._dash_size = (0, 0)
             self._dash_scaled = []
             if self._dash_job is None:
-                self._dash_job = self.after(100, lambda: self._draw_dashboard_frame(event.width, event.height) or self._schedule_dashboard_cycle())
+                def _redraw():
+                    if not self.pdf.doc:
+                        self._draw_dashboard_frame(event.width, event.height)
+                        self._schedule_dashboard_cycle()
+                self._dash_job = self.after(150, _redraw)
 
     def _ask_text_with_bangla(self, prompt="Enter text:"):
         """Text entry dialog with optional on-screen Bangla keyboard."""
