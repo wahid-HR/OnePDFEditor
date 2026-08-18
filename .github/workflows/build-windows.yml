@@ -1,0 +1,40 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build single-file executable
+        run: |
+          pyinstaller --noconfirm OfflinePDFEditor.spec
+
+      - name: List dist folder
+        run: |
+          dir dist
+
+      - name: Upload OnePDFEditor.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePDFEditor-Windows
+          path: dist/OnePDFEditor.exe
+          if-no-files-found: error
+          retention-days: 14
