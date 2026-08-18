@@ -421,14 +421,8 @@ class PDFDocument:
             _ = fitz.Font(use_font)
         except Exception:
             use_font = "helv"
-        target_width = max(bbox.width, 1.0)
-        fitted_size = float(fontsize)
-        try:
-            width = measure_text_width(new_text, use_font, fitted_size)
-            if width > target_width * 1.15:
-                fitted_size = max(MIN_FONT_SIZE, fitted_size * (target_width / width) * 0.98)
-        except Exception:
-            pass
+        # Honor user-requested size (do not auto-shrink when size is set from UI)
+        fitted_size = max(MIN_FONT_SIZE, min(96.0, float(fontsize)))
         # Sample approximate background from page render near the span
         bg_fill = (1, 1, 1)
         try:
@@ -1449,10 +1443,17 @@ class OnePDFEditor(tk.Tk):
         # Format bar above the text
         self._fmt_frame = tk.Frame(self.canvas, bg="#2a2a3c", padx=4, pady=2)
         tk.Label(self._fmt_frame, text="Size:", bg="#2a2a3c", fg="#e8e8f0", font=("Segoe UI", 8)).pack(side=tk.LEFT)
-        self._fmt_size = tk.StringVar(value=str(int(span["size"])))
+        self._fmt_size = tk.StringVar(value=str(int(round(float(span["size"])))))
+        tk.Button(self._fmt_frame, text="−", command=lambda: self._bump_fmt_size(-1),
+                  bg="#34344a", fg="#e8e8f0", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
+                  width=2, padx=2).pack(side=tk.LEFT)
         size_entry = tk.Entry(self._fmt_frame, textvariable=self._fmt_size, width=4,
-                              bg="#34344a", fg="#e8e8f0", relief=tk.FLAT, font=("Segoe UI", 9))
+                              bg="#34344a", fg="#e8e8f0", relief=tk.FLAT, font=("Segoe UI", 9),
+                              justify=tk.CENTER)
         size_entry.pack(side=tk.LEFT, padx=2)
+        tk.Button(self._fmt_frame, text="+", command=lambda: self._bump_fmt_size(1),
+                  bg="#34344a", fg="#e8e8f0", relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
+                  width=2, padx=2).pack(side=tk.LEFT)
         self._fmt_bold = tk.BooleanVar(value=bool(span.get("flags", 0) & 16))
         self._fmt_italic = tk.BooleanVar(value=bool(span.get("flags", 0) & 2))
         tk.Checkbutton(self._fmt_frame, text="B", variable=self._fmt_bold, bg="#2a2a3c", fg="#e8e8f0",
@@ -1483,6 +1484,14 @@ class OnePDFEditor(tk.Tk):
         self._edit_entry.bind("<Escape>", lambda e: self._cancel_inline_edit())
         self.status.config(text="Edit text + set Size / Bold / Italic — Apply or Enter")
 
+    def _bump_fmt_size(self, delta):
+        try:
+            cur = float(self._fmt_size.get())
+        except Exception:
+            cur = 12.0
+        cur = max(4.0, min(96.0, cur + delta))
+        self._fmt_size.set(str(int(cur) if cur == int(cur) else cur))
+
     def _open_bangla_kb(self):
         """Open on-screen Bangla keyboard targeting the inline edit Entry."""
         if not self._edit_entry:
@@ -1512,6 +1521,7 @@ class OnePDFEditor(tk.Tk):
         page = self.selected_page
         try:
             fs = float(self._fmt_size.get())
+            fs = max(4.0, min(96.0, fs))
         except Exception:
             fs = float(span["size"])
         bold = bool(self._fmt_bold.get()) if hasattr(self, "_fmt_bold") else False
