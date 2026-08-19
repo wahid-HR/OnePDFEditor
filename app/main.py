@@ -7,9 +7,11 @@ Offline PDF / Image / Document viewer & editor for Windows.
 """
 
 import os
+import queue
 import sys
 import io
 import tempfile
+import webbrowser
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime
@@ -357,6 +359,78 @@ class PDFDocument:
 
     def page_count(self):
         return len(self.doc) if self.doc else 0
+
+    def get_page_links(self, page_idx):
+        page = self.get_page(page_idx)
+        if not page:
+            return []
+        try:
+            return list(page.get_links())
+        except Exception:
+            return []
+
+    def update_link_uri(self, page_idx, link, new_uri):
+        page = self.get_page(page_idx)
+        if not page or not link:
+            return False, "Invalid"
+        self.save_state()
+        try:
+            new_uri = (new_uri or "").strip()
+            if not new_uri:
+                return False, "Empty URL"
+            # Delete old, insert updated copy
+            old = dict(link)
+            page.delete_link(old)
+            nl = dict(old)
+            nl["uri"] = new_uri
+            nl["kind"] = fitz.LINK_URI
+            # keep 'from' rect
+            page.insert_link(nl)
+            self.dirty = True
+            return True, "Link updated"
+        except Exception as e:
+            return False, str(e)
+
+    def delete_link(self, page_idx, link):
+        page = self.get_page(page_idx)
+        if not page or not link:
+            return False, "Invalid"
+        self.save_state()
+        try:
+            page.delete_link(dict(link))
+            self.dirty = True
+            return True, "Link removed"
+        except Exception as e:
+            return False, str(e)
+
+    def add_uri_link(self, page_idx, rect, uri):
+        page = self.get_page(page_idx)
+        if not page:
+            return False, "Invalid page"
+        uri = (uri or "").strip()
+        if not uri:
+            return False, "Empty URL"
+        if not (uri.startswith("http://") or uri.startswith("https://") or uri.startswith("mailto:")):
+            if "@" in uri and " " not in uri:
+                uri = "mailto:" + uri
+            else:
+                uri = "https://" + uri
+        self.save_state()
+        try:
+            r = fitz.Rect(rect)
+            r.normalize()
+            if r.width < 3 or r.height < 3:
+                return False, "Area too small"
+            page.insert_link({
+                "kind": fitz.LINK_URI,
+                "from": r,
+                "uri": uri,
+            })
+            self.dirty = True
+            return True, "Link added"
+        except Exception as e:
+            return False, str(e)
+
 
     def get_page(self, idx):
         if self.doc and 0 <= idx < len(self.doc):
@@ -1333,6 +1407,8 @@ class OnePDFEditor(tk.Tk):
         self._set_app_icon()
         self.MAX_TABS = 6
         self.tabs = []  # list[TabSession]
+        self._drop_queue = queue.Queue()
+        self._drop_busy = False
         self.active_tab = -1
         self.pdf = PDFDocument()
         self.current_page = 0
@@ -1361,6 +1437,8 @@ class OnePDFEditor(tk.Tk):
         self.pick_color_mode = False
         self.copy_sign_mode = False
         self.screenshot_mode = False
+        self.link_mode = False
+        self.link_rect = None
         self.screenshot_rect = None
         self.fill_color = None  # None = auto-sample PDF background
         self.fill_color_manual = False  # True only after Pick Color
@@ -1374,8 +1452,10 @@ class OnePDFEditor(tk.Tk):
         self._dash_bg_photo = None
         self._build_ui()
         self.after(100, self.render_page)
+        self.after(300, self._poll_drop_queue)
         self._bind_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.report_callback_exception = self._tk_exception_guard
         self.update_idletasks()
         x = (self.winfo_screenwidth() - self.winfo_width()) // 2
         y = (self.winfo_screenheight() - self.winfo_height()) // 2
@@ -1465,6 +1545,10 @@ class OnePDFEditor(tk.Tk):
         tools_m.add_command(label="OCR Image Text...", command=self.ocr_current_page)
         tools_m.add_separator()
         tools_m.add_command(label="PDF Merger...", command=self.open_pdf_merger)
+        tools_m.add_separator()
+        tools_m.add_command(label="Hyperlinks on Page...", command=self.manage_hyperlinks)
+        tools_m.add_command(label="Add Hyperlink...", command=self.start_add_hyperlink)
+        tools_m.add_command(label="Add Link to Selected Text...", command=self.add_link_to_selected_text)
         tools_m.add_command(label="Set as Default PDF Viewer...", command=self.show_default_viewer_help)
 
         help_m = tk.Menu(menubar, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"], activebackground=COLORS["accent"])
@@ -2189,6 +2273,10 @@ class OnePDFEditor(tk.Tk):
                 r = canvas_rect(self.current_page, self.screenshot_rect)
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#fbbf24", width=2,
                                             dash=(5, 3), tags="sspreview")
+            if self.link_mode and self.link_rect:
+                r = canvas_rect(self.current_page, self.link_rect)
+                self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#38bdf8", width=2,
+                                            dash=(4, 2), tags="linkpreview")
         except Exception as e:
             self.status.config(text=f"Render error: {e}")
 
@@ -2246,6 +2334,12 @@ class OnePDFEditor(tk.Tk):
             self.copy_sign_rect = fitz.Rect(pt, pt)
             return
 
+        # Add hyperlink mode – start drag
+        if self.link_mode:
+            self._drag_start = pt
+            self.link_rect = fitz.Rect(pt, pt)
+            return
+
         # Fill box mode – start drag
         if self.fill_mode:
             self._drag_start = pt
@@ -2256,6 +2350,15 @@ class OnePDFEditor(tk.Tk):
             self._drag_start = pt
             self.sig_rect = fitz.Rect(pt, pt)
             return
+        # Clickable hyperlinks → open in browser (unless a drawing tool is active)
+        if not any([
+            self.link_mode, self.fill_mode, self.screenshot_mode, self.copy_sign_mode,
+            self.placing_signature, self.placing_symbol, getattr(self, "pick_color_mode", False),
+        ]):
+            # Use page under cursor (current_page already updated by _canvas_to_pdf)
+            if self._open_link_at(self.current_page, pt):
+                return
+
         spans = self.pdf.get_text_spans(self.current_page)
         hit = None
         for s in spans:
@@ -2434,6 +2537,11 @@ class OnePDFEditor(tk.Tk):
             self.copy_sign_rect.normalize()
             self.render_page()
             return
+        if self.link_mode:
+            self.link_rect = fitz.Rect(self._drag_start, pt)
+            self.link_rect.normalize()
+            self.render_page()
+            return
         if self.fill_mode:
             self.fill_rect = fitz.Rect(self._drag_start, pt)
             self.fill_rect.normalize()
@@ -2476,6 +2584,9 @@ class OnePDFEditor(tk.Tk):
             return
         if self.copy_sign_mode and self.copy_sign_rect:
             self._capture_sign_region()
+            return
+        if self.link_mode and self.link_rect:
+            self._finish_add_hyperlink()
             return
         if self.fill_mode and self.fill_rect:
             if self.fill_rect.width < 5 or self.fill_rect.height < 5:
@@ -2556,6 +2667,221 @@ class OnePDFEditor(tk.Tk):
             self._drag_start = None
             self.status.config(text="Drag a rectangle on the page to place the signature")
         SignatureDialog(self, on_done)
+
+
+
+    def _open_link_at(self, page_idx, pt):
+        """If point hits a URI link, open it in the default browser. Returns True if handled."""
+        try:
+            links = self.pdf.get_page_links(page_idx)
+        except Exception:
+            return False
+        for lk in links:
+            try:
+                r = fitz.Rect(lk.get("from"))
+                if not r.contains(pt):
+                    continue
+                uri = (lk.get("uri") or "").strip()
+                if uri:
+                    if not (uri.startswith("http://") or uri.startswith("https://") or uri.startswith("mailto:")):
+                        if "@" in uri and " " not in uri:
+                            uri = "mailto:" + uri
+                        else:
+                            uri = "https://" + uri
+                    webbrowser.open(uri)
+                    self.status.config(text=f"Opened: {uri[:80]}")
+                    return True
+                # internal go-to page
+                if lk.get("page") is not None:
+                    dest = int(lk.get("page"))
+                    if 0 <= dest < self.pdf.page_count():
+                        self.current_page = dest
+                        self._update_page_ui()
+                        self.render_page()
+                        self.scroll_to_page(dest)
+                        self.status.config(text=f"Jumped to page {dest + 1}")
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def manage_hyperlinks(self):
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a PDF first.", parent=self)
+            return
+        links = self.pdf.get_page_links(self.current_page)
+        win = tk.Toplevel(self)
+        win.title(f"Hyperlinks — page {self.current_page + 1}")
+        win.configure(bg=COLORS["surface"])
+        win.geometry("560x360")
+        win.transient(self)
+        tk.Label(
+            win,
+            text="Select a link to edit URL, replace, or delete",
+            bg=COLORS["surface"], fg=COLORS["text_dim"], font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, padx=10, pady=(10, 4))
+        lb = tk.Listbox(
+            win, bg=COLORS["surface2"], fg=COLORS["text"], font=("Segoe UI", 10),
+            selectbackground=COLORS["accent"], relief=tk.FLAT, activestyle="none",
+        )
+        lb.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        items = []
+        for i, lk in enumerate(links):
+            kind = lk.get("kind")
+            uri = lk.get("uri") or ""
+            page_dest = lk.get("page")
+            frm = lk.get("from")
+            if uri:
+                label = f"{i+1}. URI  {uri[:80]}"
+            elif page_dest is not None:
+                label = f"{i+1}. Go to page {int(page_dest) + 1}"
+            else:
+                label = f"{i+1}. Link kind={kind}"
+            if frm:
+                label += f"  @ ({frm.x0:.0f},{frm.y0:.0f})"
+            lb.insert(tk.END, label)
+            items.append(lk)
+        if not items:
+            lb.insert(tk.END, "(No links on this page)")
+        bf = tk.Frame(win, bg=COLORS["surface"])
+        bf.pack(fill=tk.X, padx=10, pady=10)
+
+        def selected_link():
+            sel = lb.curselection()
+            if not sel or not items:
+                return None
+            return items[int(sel[0])]
+
+        def do_edit():
+            lk = selected_link()
+            if not lk:
+                messagebox.showinfo("Select", "Select a link first.", parent=win)
+                return
+            cur = lk.get("uri") or ""
+            new = simpledialog.askstring(
+                "Edit / Replace URL",
+                "Enter new URL (http/https/mailto):",
+                initialvalue=cur,
+                parent=win,
+            )
+            if new is None:
+                return
+            ok, msg = self.pdf.update_link_uri(self.current_page, lk, new)
+            if ok:
+                self.render_page()
+                win.destroy()
+                self.manage_hyperlinks()
+                self.status.config(text=msg)
+            else:
+                messagebox.showerror("Failed", msg, parent=win)
+
+        def do_delete():
+            lk = selected_link()
+            if not lk:
+                return
+            if not messagebox.askyesno("Delete", "Remove this hyperlink?", parent=win):
+                return
+            ok, msg = self.pdf.delete_link(self.current_page, lk)
+            if ok:
+                self.render_page()
+                win.destroy()
+                self.manage_hyperlinks()
+                self.status.config(text=msg)
+            else:
+                messagebox.showerror("Failed", msg, parent=win)
+
+        def do_add():
+            win.destroy()
+            self.start_add_hyperlink()
+
+        tk.Button(bf, text="Edit / Replace URL", command=do_edit, bg=COLORS["accent"], fg="white",
+                  relief=tk.FLAT, padx=10, pady=4, font=("Segoe UI", 9), cursor="hand2").pack(side=tk.LEFT, padx=3)
+        tk.Button(bf, text="Delete", command=do_delete, bg="#ef4444", fg="white",
+                  relief=tk.FLAT, padx=10, pady=4, font=("Segoe UI", 9), cursor="hand2").pack(side=tk.LEFT, padx=3)
+        tk.Button(bf, text="Add New…", command=do_add, bg=COLORS["surface2"], fg=COLORS["text"],
+                  relief=tk.FLAT, padx=10, pady=4, font=("Segoe UI", 9), cursor="hand2").pack(side=tk.LEFT, padx=3)
+        tk.Button(bf, text="Close", command=win.destroy, bg=COLORS["surface2"], fg=COLORS["text"],
+                  relief=tk.FLAT, padx=10, pady=4, font=("Segoe UI", 9), cursor="hand2").pack(side=tk.RIGHT, padx=3)
+
+
+    def add_link_to_selected_text(self):
+        """Make the currently selected text span a clickable hyperlink."""
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a PDF first.", parent=self)
+            return
+        if not self.selected_span or self.selected_page < 0:
+            messagebox.showinfo(
+                "Select text",
+                "First click the text (e.g. FORM) so it is selected (green box),\n"
+                "then use Tools → Add Link to Selected Text…",
+                parent=self,
+            )
+            return
+        span = self.selected_span
+        page_idx = self.selected_page
+        sample = (span.get("text") or "").strip() or "text"
+        uri = simpledialog.askstring(
+            "Link for selected text",
+            f'Text: "{sample[:60]}"\n\nEnter URL (https://...):',
+            parent=self,
+        )
+        if not uri:
+            return
+        rect = fitz.Rect(span["bbox"])
+        # slight pad so click target is comfortable
+        rect = fitz.Rect(rect.x0 - 1, rect.y0 - 1, rect.x1 + 1, rect.y1 + 1)
+        ok, msg = self.pdf.add_uri_link(page_idx, rect, uri)
+        if ok:
+            self.render_page()
+            self.status.config(text=f'Link on "{sample[:30]}": {msg}')
+        else:
+            messagebox.showerror("Link failed", msg, parent=self)
+
+    def start_add_hyperlink(self):
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a PDF first.", parent=self)
+            return
+        self._cancel_ops()
+        self.link_mode = True
+        self.link_rect = None
+        try:
+            self.canvas.config(cursor="crosshair")
+        except Exception:
+            pass
+        self.status.config(text="Add hyperlink: drag a rectangle on the page, then enter URL")
+
+    def _finish_add_hyperlink(self):
+        if not self.link_rect or self.link_rect.width < 3:
+            self.link_mode = False
+            self.link_rect = None
+            try:
+                self.canvas.config(cursor="")
+            except Exception:
+                pass
+            self.status.config(text="Link area too small")
+            return
+        uri = simpledialog.askstring(
+            "Hyperlink URL",
+            "Enter URL (example: https://example.com):",
+            parent=self,
+        )
+        rect = fitz.Rect(self.link_rect)
+        self.link_mode = False
+        self.link_rect = None
+        try:
+            self.canvas.config(cursor="")
+        except Exception:
+            pass
+        if not uri:
+            self.render_page()
+            self.status.config(text="Add link cancelled")
+            return
+        ok, msg = self.pdf.add_uri_link(self.current_page, rect, uri)
+        self.render_page()
+        if ok:
+            self.status.config(text=msg)
+        else:
+            messagebox.showerror("Link failed", msg, parent=self)
 
     def take_screenshot(self):
         if not self.pdf.doc:
@@ -2653,6 +2979,8 @@ class OnePDFEditor(tk.Tk):
         self.pick_color_mode = False
         self.copy_sign_mode = False
         self.screenshot_mode = False
+        self.link_mode = False
+        self.link_rect = None
         self.placing_symbol = False
         self.symbol_char = None
         self.fill_rect = None
@@ -3078,36 +3406,72 @@ class OnePDFEditor(tk.Tk):
                 break
 
     def _decode_drop_path(self, f):
-        if isinstance(f, bytes):
-            for enc in ("utf-8", "mbcs", "cp1252", "latin-1"):
-                try:
-                    return f.decode(enc).strip("\x00").strip()
-                except Exception:
-                    continue
-            try:
-                return os.fsdecode(f).strip("\x00").strip()
-            except Exception:
-                return f.decode("utf-8", errors="ignore").strip()
-        return str(f).strip("\x00").strip()
+        try:
+            if isinstance(f, bytes):
+                s = None
+                for enc in ("utf-8", "mbcs", "cp1252", "latin-1"):
+                    try:
+                        s = f.decode(enc)
+                        break
+                    except Exception:
+                        pass
+                if not s:
+                    try:
+                        s = os.fsdecode(f)
+                    except Exception:
+                        s = f.decode("utf-8", errors="ignore")
+            else:
+                s = str(f)
+            s = s.replace("\x00", "").strip().strip('"').strip("'")
+            # also strip real nulls
+            s = "".join(ch for ch in s if ch != "\0" and ord(ch) != 0)
+            if s.startswith("{") and s.endswith("}"):
+                s = s[1:-1]
+            return s
+        except Exception:
+            return ""
 
     def _on_windnd_drop(self, files):
-        # Must never raise — windnd crashes the app on uncaught errors
+        """Windnd runs off the Tk thread — only enqueue paths, never touch Tk here."""
         try:
-            paths = []
-            for f in (files or []):
-                try:
-                    p = self._decode_drop_path(f)
-                    p = (p or "").strip().strip('"').strip("'")
-                    if p.startswith("{") and p.endswith("}"):
-                        p = p[1:-1]
-                    if p and os.path.isfile(p):
-                        paths.append(p)
-                except Exception:
-                    continue
-            if not paths:
+            if files is None:
                 return
-            # Queue on UI thread; copy list to avoid cross-thread issues
-            self.after(50, lambda ps=list(paths): self._safe_load_dropped_list(ps))
+            raw = files
+            if isinstance(raw, (str, bytes)):
+                raw = [raw]
+            try:
+                iterable = list(raw)
+            except Exception:
+                return
+            paths = []
+            for f in iterable:
+                p = self._decode_drop_path(f)
+                if p and os.path.isfile(p):
+                    paths.append(p)
+            if paths:
+                self._drop_queue.put(paths)
+        except Exception:
+            pass
+
+    def _poll_drop_queue(self):
+        """UI-thread poller for dropped files (prevents windnd/Tk cross-thread crash)."""
+        try:
+            if not getattr(self, "_drop_busy", False):
+                paths = None
+                try:
+                    paths = self._drop_queue.get_nowait()
+                except Exception:
+                    paths = None
+                if paths:
+                    self._drop_busy = True
+                    try:
+                        self._safe_load_dropped_list(paths)
+                    finally:
+                        self._drop_busy = False
+        except Exception:
+            self._drop_busy = False
+        try:
+            self.after(250, self._poll_drop_queue)
         except Exception:
             pass
 
@@ -3115,20 +3479,25 @@ class OnePDFEditor(tk.Tk):
         try:
             if not paths:
                 return
-            self._stop_dashboard()
+            try:
+                self._stop_dashboard()
+            except Exception:
+                pass
             self.screenshot_mode = False
             self.fill_mode = False
             self.copy_sign_mode = False
             self.placing_signature = False
             self.placing_symbol = False
+            self.link_mode = False
             self._move_active = False
-            # Open first file; extras as extra tabs if room
-            for i, path in enumerate(paths[: self.MAX_TABS]):
+            for path in list(paths)[: self.MAX_TABS]:
                 try:
+                    if not path or not os.path.isfile(path):
+                        continue
                     self._load_path(path)
                 except Exception as e:
                     try:
-                        messagebox.showerror("Open failed", f"{path}\n{e}", parent=self)
+                        messagebox.showerror("Open failed", str(e), parent=self)
                     except Exception:
                         pass
                     break
@@ -3338,6 +3707,12 @@ class OnePDFEditor(tk.Tk):
             self.status.config(text=f"Symbol placed: {char}")
         except Exception as e:
             messagebox.showerror("Symbol", str(e), parent=self)
+
+    def _tk_exception_guard(self, exc_type, exc_value, exc_tb):
+        try:
+            self.status.config(text=f"Error: {exc_value}")
+        except Exception:
+            pass
 
     def show_about(self):
         messagebox.showinfo(
