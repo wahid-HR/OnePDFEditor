@@ -1320,6 +1320,7 @@ class TabSession:
         self.highlight_rect = None
         self.selected_span = None
         self.selected_page = -1
+        self.scroll_y = 0.0  # canvas yview fraction
 
 
 class OnePDFEditor(tk.Tk):
@@ -1611,13 +1612,22 @@ class OnePDFEditor(tk.Tk):
     def _push_ui_to_tab(self):
         if self.active_tab < 0 or self.active_tab >= len(self.tabs):
             return
+        # Capture scroll-synced page before saving
+        try:
+            self._sync_page_from_scroll()
+        except Exception:
+            pass
         t = self.tabs[self.active_tab]
         t.pdf = self.pdf
-        t.current_page = self.current_page
-        t.zoom = self.zoom
+        t.current_page = int(self.current_page)
+        t.zoom = float(self.zoom)
         t.highlight_rect = self.highlight_rect
         t.selected_span = self.selected_span
         t.selected_page = self.selected_page
+        try:
+            t.scroll_y = float(self.canvas.yview()[0])
+        except Exception:
+            t.scroll_y = 0.0
         if self.pdf.path:
             t.title = os.path.basename(self.pdf.path)
         elif self.pdf.doc:
@@ -1634,8 +1644,16 @@ class OnePDFEditor(tk.Tk):
             return
         t = self.tabs[self.active_tab]
         self.pdf = t.pdf
-        self.current_page = t.current_page
-        self.zoom = t.zoom
+        # Clamp page to this document's range
+        n = t.pdf.page_count() if t.pdf.doc else 0
+        cp = int(t.current_page or 0)
+        if n > 0:
+            cp = max(0, min(cp, n - 1))
+        else:
+            cp = 0
+        self.current_page = cp
+        t.current_page = cp
+        self.zoom = float(t.zoom or DEFAULT_ZOOM)
         self.highlight_rect = t.highlight_rect
         self.selected_span = t.selected_span
         self.selected_page = t.selected_page
@@ -1696,12 +1714,31 @@ class OnePDFEditor(tk.Tk):
         self._refresh_tab_bar()
         self._update_page_ui()
         self.render_page()
+        # Restore this tab's page / scroll (must be after render builds layout)
+        def _restore():
+            try:
+                t = self.tabs[self.active_tab]
+                n = self.pdf.page_count() if self.pdf.doc else 0
+                if n > 0:
+                    self.current_page = max(0, min(int(t.current_page), n - 1))
+                    self._update_page_ui()
+                    # Prefer exact scroll fraction if valid, else jump to saved page
+                    sy = float(getattr(t, "scroll_y", 0.0) or 0.0)
+                    if 0.0 <= sy <= 1.0 and sy > 0.001:
+                        self.canvas.yview_moveto(sy)
+                    else:
+                        self.scroll_to_page(self.current_page)
+            except Exception:
+                pass
+        self.after(20, _restore)
         if self.pdf.doc:
             try:
                 self.drop_hint.pack_forget()
             except Exception:
                 pass
-            self.status.config(text=f"Tab {idx + 1}: {self.tabs[idx].title}")
+            self.status.config(
+                text=f"Tab {idx + 1}: {self.tabs[idx].title}  ·  page {self.current_page + 1}"
+            )
         else:
             self.status.config(text="Empty tab")
 
