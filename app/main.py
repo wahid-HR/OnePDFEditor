@@ -1381,15 +1381,9 @@ class OnePDFEditor(tk.Tk):
         self.geometry(f"+{x}+{y}")
 
     def _set_app_icon(self):
-        """Set window/taskbar icon from packaged assets (title bar & taskbar only)."""
+        """Set window/taskbar icon — prefer multi-size ICO on Windows, PNG fallback."""
         try:
-            png = resource_path("assets", "icon_256.png")
-            if not png.exists():
-                png = resource_path("assets", "icon_64.png")
-            if png.exists():
-                img = Image.open(png)
-                self._app_icon_img = ImageTk.PhotoImage(img)
-                self.iconphoto(True, self._app_icon_img)
+            self._app_icon_imgs = []
             ico = resource_path("assets", "OnePDFEditor.ico")
             if ico.exists() and sys.platform.startswith("win"):
                 try:
@@ -1397,6 +1391,23 @@ class OnePDFEditor(tk.Tk):
                 except Exception:
                     try:
                         self.iconbitmap(str(ico))
+                    except Exception:
+                        pass
+            for name in ("icon_256.png", "icon_128.png", "icon_64.png", "icon_32.png"):
+                png = resource_path("assets", name)
+                if png.exists():
+                    try:
+                        img = Image.open(png).convert("RGBA")
+                        ph = ImageTk.PhotoImage(img)
+                        self._app_icon_imgs.append(ph)
+                    except Exception:
+                        pass
+            if self._app_icon_imgs:
+                try:
+                    self.iconphoto(True, *self._app_icon_imgs)
+                except Exception:
+                    try:
+                        self.iconphoto(True, self._app_icon_imgs[0])
                     except Exception:
                         pass
         except Exception:
@@ -1486,37 +1497,40 @@ class OnePDFEditor(tk.Tk):
 
         toolbar = tk.Frame(self, bg=COLORS["toolbar"])
         toolbar.pack(side=tk.TOP, fill=tk.X)
-        inner = tk.Frame(toolbar, bg=COLORS["toolbar"])
-        inner.pack(side=tk.LEFT, padx=8, pady=6)
+        # Row 1 — file / edit / tools (always visible)
+        row1 = tk.Frame(toolbar, bg=COLORS["toolbar"])
+        row1.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(6, 2))
         for text, cmd in [("Open", self.open_file), ("Save", self.save_pdf), ("Save As", self.save_as_pdf)]:
-            self._make_tool_btn(inner, text, cmd).pack(side=tk.LEFT, padx=3)
-        self._make_tool_btn(inner, "🖨 Print", self.print_document).pack(side=tk.LEFT, padx=3)
-        self._make_tool_btn(inner, "Merge", self.open_pdf_merger).pack(side=tk.LEFT, padx=3)
-        tk.Frame(inner, width=12, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
+            self._make_tool_btn(row1, text, cmd).pack(side=tk.LEFT, padx=2)
+        self._make_tool_btn(row1, "Print", self.print_document).pack(side=tk.LEFT, padx=2)
+        self._make_tool_btn(row1, "Merge", self.open_pdf_merger).pack(side=tk.LEFT, padx=2)
+        tk.Frame(row1, width=8, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
         for text, cmd in [("Undo", self.undo), ("Search", self.show_search)]:
-            self._make_tool_btn(inner, text, cmd).pack(side=tk.LEFT, padx=3)
-        self._make_tool_btn(inner, "✓", lambda: self.start_place_symbol("✓")).pack(side=tk.LEFT, padx=3)
-        tk.Frame(inner, width=8, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
+            self._make_tool_btn(row1, text, cmd).pack(side=tk.LEFT, padx=2)
+        self._make_tool_btn(row1, "✓", lambda: self.start_place_symbol("✓")).pack(side=tk.LEFT, padx=2)
+        tk.Frame(row1, width=8, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
         for text, cmd in [("Sign", self.start_signature), ("Copy Sign", self.start_copy_sign_region),
                           ("Fill Box", self.start_fill_box), ("Screenshot", self.take_screenshot)]:
-            self._make_tool_btn(inner, text, cmd).pack(side=tk.LEFT, padx=3)
-        tk.Frame(inner, width=12, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
-        self._make_tool_btn(inner, "◀ Prev", self.prev_page).pack(side=tk.LEFT, padx=2)
-        self._make_tool_btn(inner, "Next ▶", self.next_page).pack(side=tk.LEFT, padx=2)
-        tk.Label(inner, text="Page", bg=COLORS["toolbar"], fg=COLORS["text_dim"], font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(8, 2))
+            self._make_tool_btn(row1, text, cmd).pack(side=tk.LEFT, padx=2)
+        # Row 2 — page / zoom (fits small widths)
+        row2 = tk.Frame(toolbar, bg=COLORS["toolbar"])
+        row2.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(2, 6))
+        self._make_tool_btn(row2, "Prev", self.prev_page).pack(side=tk.LEFT, padx=2)
+        self._make_tool_btn(row2, "Next", self.next_page).pack(side=tk.LEFT, padx=2)
+        tk.Label(row2, text="Page", bg=COLORS["toolbar"], fg=COLORS["text_dim"], font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(8, 2))
         self.page_var = tk.StringVar(value="1")
-        page_entry = tk.Entry(inner, textvariable=self.page_var, width=4, bg=COLORS["surface2"], fg=COLORS["text"],
+        page_entry = tk.Entry(row2, textvariable=self.page_var, width=4, bg=COLORS["surface2"], fg=COLORS["text"],
                               insertbackground=COLORS["text"], relief=tk.FLAT, font=("Segoe UI", 10))
         page_entry.pack(side=tk.LEFT)
         page_entry.bind("<Return>", self._goto_page)
-        self.page_count_lbl = tk.Label(inner, text="/ 0", bg=COLORS["toolbar"], fg=COLORS["text_dim"], font=("Segoe UI", 9))
+        self.page_count_lbl = tk.Label(row2, text="/ 0", bg=COLORS["toolbar"], fg=COLORS["text_dim"], font=("Segoe UI", 9))
         self.page_count_lbl.pack(side=tk.LEFT, padx=4)
-        tk.Frame(inner, width=12, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
-        self._make_tool_btn(inner, "-", lambda: self.set_zoom(self.zoom / 1.25)).pack(side=tk.LEFT)
-        self.zoom_lbl = tk.Label(inner, text="100%", bg=COLORS["toolbar"], fg=COLORS["text"], font=("Segoe UI", 9), width=5)
+        tk.Frame(row2, width=12, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
+        self._make_tool_btn(row2, "-", lambda: self.set_zoom(self.zoom / 1.25)).pack(side=tk.LEFT)
+        self.zoom_lbl = tk.Label(row2, text="100%", bg=COLORS["toolbar"], fg=COLORS["text"], font=("Segoe UI", 9), width=5)
         self.zoom_lbl.pack(side=tk.LEFT, padx=4)
-        self._make_tool_btn(inner, "+", lambda: self.set_zoom(self.zoom * 1.25)).pack(side=tk.LEFT)
-        self._make_tool_btn(inner, "Fit", self.fit_page).pack(side=tk.LEFT, padx=4)
+        self._make_tool_btn(row2, "+", lambda: self.set_zoom(self.zoom * 1.25)).pack(side=tk.LEFT)
+        self._make_tool_btn(row2, "Fit", self.fit_page).pack(side=tk.LEFT, padx=4)
 
         # Tab bar (up to 6 open files)
         self.tab_bar = tk.Frame(self, bg=COLORS["surface"], height=34)
@@ -1662,21 +1676,12 @@ class OnePDFEditor(tk.Tk):
             )
             close.pack(side=tk.LEFT)
             self._tab_buttons.extend([fr, btn, close])
-        # New tab hint when under max
-        if len(self.tabs) < self.MAX_TABS:
-            add = tk.Button(
-                self.tab_bar, text="+", command=self.open_file,
-                bg=COLORS["surface"], fg=COLORS["text_dim"], relief=tk.FLAT,
-                font=("Segoe UI", 12, "bold"), padx=8, cursor="hand2",
-            )
-            add.pack(side=tk.LEFT, padx=4, pady=4)
-            self._tab_buttons.append(add)
         if not self.tabs:
             empty = tk.Label(
-                self.tab_bar, text="  No files open — Open or drag a file (max 6 tabs)",
+                self.tab_bar, text="No files open — Open or drag a file (max 6 tabs)",
                 bg=COLORS["surface"], fg=COLORS["text_dim"], font=("Segoe UI", 9),
             )
-            empty.pack(side=tk.LEFT, padx=8)
+            empty.pack(side=tk.LEFT, padx=10, pady=6)
             self._tab_buttons.append(empty)
 
     def switch_tab(self, idx):
@@ -3049,34 +3054,55 @@ class OnePDFEditor(tk.Tk):
         return str(f).strip("\x00").strip()
 
     def _on_windnd_drop(self, files):
-        # windnd may call from a non-UI thread — always marshal to Tk main loop
+        # Must never raise — windnd crashes the app on uncaught errors
         try:
-            path = None
+            paths = []
             for f in (files or []):
-                p = self._decode_drop_path(f)
-                if p and os.path.isfile(p):
-                    path = p
-                    break
-            if path:
-                self.after(10, lambda p=path: self._safe_load_dropped(p))
-        except Exception as e:
-            err = str(e)
-            self.after(0, lambda: self.status.config(text=f"Drop failed: {err}"))
+                try:
+                    p = self._decode_drop_path(f)
+                    p = (p or "").strip().strip('"').strip("'")
+                    if p.startswith("{") and p.endswith("}"):
+                        p = p[1:-1]
+                    if p and os.path.isfile(p):
+                        paths.append(p)
+                except Exception:
+                    continue
+            if not paths:
+                return
+            # Queue on UI thread; copy list to avoid cross-thread issues
+            self.after(50, lambda ps=list(paths): self._safe_load_dropped_list(ps))
+        except Exception:
+            pass
 
-    def _safe_load_dropped(self, path):
-        """Load dropped file safely on the UI thread."""
+    def _safe_load_dropped_list(self, paths):
         try:
+            if not paths:
+                return
             self._stop_dashboard()
             self.screenshot_mode = False
             self.fill_mode = False
             self.copy_sign_mode = False
             self.placing_signature = False
-            self._load_path(path)
+            self.placing_symbol = False
+            self._move_active = False
+            # Open first file; extras as extra tabs if room
+            for i, path in enumerate(paths[: self.MAX_TABS]):
+                try:
+                    self._load_path(path)
+                except Exception as e:
+                    try:
+                        messagebox.showerror("Open failed", f"{path}\n{e}", parent=self)
+                    except Exception:
+                        pass
+                    break
         except Exception as e:
             try:
-                messagebox.showerror("Open failed", str(e), parent=self)
+                messagebox.showerror("Drop failed", str(e), parent=self)
             except Exception:
                 pass
+
+    def _safe_load_dropped(self, path):
+        self._safe_load_dropped_list([path] if path else [])
 
     def _on_canvas_configure(self, event):
         if self.pdf.doc:
