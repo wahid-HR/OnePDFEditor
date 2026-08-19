@@ -1432,6 +1432,8 @@ class OnePDFEditor(tk.Tk):
         self._set_app_icon()
         self.MAX_TABS = 6
         self.tabs = []  # list[TabSession]
+        self.edit_mode = False
+        self.link_edit_mode = False
         self._drop_queue = queue.Queue()
         self._drop_busy = False
         self.active_tab = -1
@@ -1464,6 +1466,7 @@ class OnePDFEditor(tk.Tk):
         self.screenshot_mode = False
         self.link_mode = False
         self.link_rect = None
+        self.link_edit_mode = False
         self.screenshot_rect = None
         self.fill_color = None  # None = auto-sample PDF background
         self.fill_color_manual = False  # True only after Pick Color
@@ -1612,6 +1615,9 @@ class OnePDFEditor(tk.Tk):
         row1.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(6, 2))
         for text, cmd in [("Open", self.open_file), ("Save", self.save_pdf), ("Save As", self.save_as_pdf)]:
             self._make_tool_btn(row1, text, cmd).pack(side=tk.LEFT, padx=2)
+        self.btn_edit_mode = self._make_tool_btn(row1, "View Mode", self.toggle_edit_mode)
+        self.btn_edit_mode.pack(side=tk.LEFT, padx=6)
+        self.btn_edit_mode.config(bg="#0ea5e9", fg="white")
         self._make_tool_btn(row1, "Print", self.print_document).pack(side=tk.LEFT, padx=2)
         self._make_tool_btn(row1, "Merge", self.open_pdf_merger).pack(side=tk.LEFT, padx=2)
         tk.Frame(row1, width=8, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
@@ -1983,6 +1989,7 @@ class OnePDFEditor(tk.Tk):
             self.selected_span = None
             self._push_ui_to_tab()
             self._refresh_tab_bar()
+            self.set_edit_mode(False)
             self._update_page_ui()
             self.render_page()
             self.fit_width()
@@ -2302,6 +2309,16 @@ class OnePDFEditor(tk.Tk):
                 r = canvas_rect(self.current_page, self.link_rect)
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#38bdf8", width=2,
                                             dash=(4, 2), tags="linkpreview")
+            if self.link_edit_mode:
+                try:
+                    for lk in self.pdf.get_page_links(self.current_page):
+                        r = canvas_rect(self.current_page, lk.get("from"))
+                        self.canvas.create_rectangle(
+                            r.x0, r.y0, r.x1, r.y1, outline="#38bdf8", width=2,
+                            dash=(3, 2), tags="link_highlight",
+                        )
+                except Exception:
+                    pass
         except Exception as e:
             self.status.config(text=f"Render error: {e}")
 
@@ -2375,15 +2392,27 @@ class OnePDFEditor(tk.Tk):
             self._drag_start = pt
             self.sig_rect = fitz.Rect(pt, pt)
             return
-        # Open hyperlink in browser only with Ctrl+Click (normal click = select/edit text)
-        if not any([
+        tool_busy = any([
             self.link_mode, self.fill_mode, self.screenshot_mode, self.copy_sign_mode,
             self.placing_signature, self.placing_symbol, getattr(self, "pick_color_mode", False),
-        ]):
-            ctrl = bool(event.state & 0x0004)
-            if ctrl and self._open_link_at(self.current_page, pt):
+        ])
+
+        # Link-edit mode: click a link area → edit URL dialog
+        if self.link_edit_mode and not tool_busy:
+            if self._edit_link_at(self.current_page, pt):
                 return
 
+        # VIEW mode: click link → browser (text stays unchanged)
+        if (not self.edit_mode) and (not tool_busy):
+            if self._open_link_at(self.current_page, pt):
+                return
+            # no text selection in view mode
+            self.selected_span = None
+            self.render_page()
+            self.status.config(text="VIEW mode — click a link to open · switch to Edit Mode to change content")
+            return
+
+        # EDIT mode: normal tools / text select
         spans = self.pdf.get_text_spans(self.current_page)
         hit = None
         for s in spans:
@@ -2415,6 +2444,9 @@ class OnePDFEditor(tk.Tk):
             self.render_page()
 
     def _on_double_click(self, event):
+        if not self.edit_mode:
+            self.status.config(text="Switch to Edit Mode to edit text")
+            return
         if self.selected_span and self.selected_page == self.current_page:
             self._start_inline_edit()
 
@@ -2695,6 +2727,63 @@ class OnePDFEditor(tk.Tk):
 
 
 
+
+    def _require_edit_mode(self, action="edit"):
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a file first.", parent=self)
+            return False
+        if not self.edit_mode:
+            if messagebox.askyesno(
+                "Edit Mode",
+                f"File is in View Mode.\n\nSwitch to Edit Mode to {action}?",
+                parent=self,
+            ):
+                self.set_edit_mode(True)
+                return True
+            return False
+        return True
+
+    def _on_escape(self, event=None):
+        if self.link_edit_mode:
+            self.link_edit_mode = False
+            try:
+                self.canvas.config(cursor="")
+            except Exception:
+                pass
+            self.render_page()
+            self.status.config(text="Link edit cancelled")
+            return
+        if self.link_mode or self.fill_mode or self.screenshot_mode or self.copy_sign_mode:
+            self._cancel_ops()
+            self.render_page()
+            self.status.config(text="Tool cancelled")
+            return
+        self._cancel_inline_edit()
+
+    def toggle_edit_mode(self):
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a file first.", parent=self)
+            return
+        self.set_edit_mode(not self.edit_mode)
+
+    def set_edit_mode(self, enabled):
+        self.edit_mode = bool(enabled)
+        self.link_edit_mode = False
+        if not self.edit_mode:
+            self._cancel_ops()
+            self.selected_span = None
+            self._move_active = False
+        try:
+            if self.edit_mode:
+                self.btn_edit_mode.config(text="Edit Mode", bg="#22c55e", fg="white")
+                self.status.config(text="EDIT mode — text, tools, links editable")
+            else:
+                self.btn_edit_mode.config(text="View Mode", bg="#0ea5e9", fg="white")
+                self.status.config(text="VIEW mode — click links to open in browser · press Edit Mode to change PDF")
+        except Exception:
+            pass
+        self.render_page()
+
     def _open_link_at(self, page_idx, pt):
         """If point hits a URI link, open it in the default browser. Returns True if handled."""
         try:
@@ -2731,88 +2820,119 @@ class OnePDFEditor(tk.Tk):
         return False
 
     def manage_hyperlinks(self):
+        """Clean hyperlink manager window: list, edit URL, save, add, delete."""
         if not self.pdf.doc:
             messagebox.showinfo("No file", "Open a PDF first.", parent=self)
             return
+        if not self._require_edit_mode("edit hyperlinks"):
+            return
+
         page_idx = self.current_page
-        links = self.pdf.get_page_links(page_idx)
+        self.link_edit_mode = True
+        self.render_page()
 
         win = tk.Toplevel(self)
-        win.title(f"Hyperlinks — page {page_idx + 1}")
+        win.title(f"Hyperlinks — Page {page_idx + 1}")
         win.configure(bg=COLORS["surface"])
-        win.geometry("620x420")
+        win.minsize(560, 400)
+        win.geometry("640x460")
         win.transient(self)
-        win.grab_set()
 
+        # Header
+        hdr = tk.Frame(win, bg=COLORS["surface"])
+        hdr.pack(fill=tk.X, padx=16, pady=(16, 8))
         tk.Label(
-            win,
-            text="1) Select a link below  2) Change URL  3) Click Save URL\n"
-                 "Or use Add New Link to draw an area on the page.",
-            bg=COLORS["surface"], fg=COLORS["text_dim"], font=("Segoe UI", 9),
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W, padx=12, pady=(12, 6))
+            hdr,
+            text="Hyperlinks on this page",
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=("Segoe UI", 13, "bold"),
+        ).pack(anchor=tk.W)
+        tk.Label(
+            hdr,
+            text="Select a link → edit URL below → Save URL.  Text on PDF does not change.",
+            bg=COLORS["surface"], fg=COLORS["text_dim"],
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(4, 0))
 
-        mid = tk.Frame(win, bg=COLORS["surface"])
-        mid.pack(fill=tk.BOTH, expand=True, padx=12)
-
+        # List
+        list_fr = tk.Frame(win, bg=COLORS["surface"])
+        list_fr.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
         lb = tk.Listbox(
-            mid, bg=COLORS["surface2"], fg=COLORS["text"], font=("Segoe UI", 10),
-            selectbackground=COLORS["accent"], relief=tk.FLAT, activestyle="none",
-            height=10,
+            list_fr,
+            bg=COLORS["surface2"],
+            fg=COLORS["text"],
+            font=("Consolas", 10),
+            selectbackground=COLORS["accent"],
+            selectforeground="white",
+            relief=tk.FLAT,
+            activestyle="none",
+            highlightthickness=1,
+            highlightbackground=COLORS["border"] if "border" in COLORS else "#3a3a50",
+            height=12,
         )
-        sb = tk.Scrollbar(mid, command=lb.yview)
+        sb = tk.Scrollbar(list_fr, command=lb.yview)
         lb.config(yscrollcommand=sb.set)
         lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
         items = []
 
-        def refresh_list(select_idx=None):
+        def refresh(select=0):
             nonlocal items
             lb.delete(0, tk.END)
             items = list(self.pdf.get_page_links(page_idx))
             if not items:
-                lb.insert(tk.END, "(No links on this page — use Add New Link)")
+                lb.insert(tk.END, "  (No links on this page)")
                 url_var.set("")
                 return
             for i, lk in enumerate(items):
                 uri = (lk.get("uri") or "").strip()
                 if uri:
-                    label = f"{i + 1}. {uri}"
+                    lb.insert(tk.END, f"  {i + 1}.  {uri}")
                 elif lk.get("page") is not None:
-                    label = f"{i + 1}. Go to page {int(lk.get('page')) + 1}"
+                    lb.insert(tk.END, f"  {i + 1}.  → page {int(lk['page']) + 1}")
                 else:
-                    label = f"{i + 1}. (other link)"
-                lb.insert(tk.END, label)
-            if select_idx is not None and 0 <= select_idx < len(items):
-                lb.selection_clear(0, tk.END)
-                lb.selection_set(select_idx)
-                lb.see(select_idx)
-                on_select()
+                    lb.insert(tk.END, f"  {i + 1}.  (link)")
+            idx = max(0, min(select, len(items) - 1))
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(idx)
+            lb.activate(idx)
+            lb.see(idx)
+            on_select()
 
+        # URL editor — full width, always visible
+        edit_fr = tk.Frame(win, bg=COLORS["surface"])
+        edit_fr.pack(fill=tk.X, padx=16, pady=(4, 0))
+        tk.Label(
+            edit_fr, text="URL", bg=COLORS["surface"], fg=COLORS["text"],
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor=tk.W)
         url_var = tk.StringVar()
-        tk.Label(win, text="URL (edit here):", bg=COLORS["surface"], fg=COLORS["text"],
-                 font=("Segoe UI", 9)).pack(anchor=tk.W, padx=12, pady=(8, 2))
         url_entry = tk.Entry(
-            win, textvariable=url_var, font=("Segoe UI", 11),
-            bg=COLORS["surface2"], fg=COLORS["text"], insertbackground=COLORS["text"],
-            relief=tk.FLAT,
+            edit_fr,
+            textvariable=url_var,
+            font=("Segoe UI", 12),
+            bg="#1e1e2e",
+            fg="#f8f8ff",
+            insertbackground="#f8f8ff",
+            relief=tk.SOLID,
+            bd=1,
         )
-        url_entry.pack(fill=tk.X, padx=12, pady=4, ipady=6)
+        url_entry.pack(fill=tk.X, pady=(4, 0), ipady=10)
 
         def on_select(event=None):
             sel = lb.curselection()
             if not sel or not items:
                 return
-            lk = items[int(sel[0])]
-            url_var.set(lk.get("uri") or "")
-            url_entry.focus_set()
-            url_entry.selection_range(0, tk.END)
+            i = int(sel[0])
+            if i >= len(items):
+                return
+            url_var.set((items[i].get("uri") or "").strip())
+            url_entry.icursor(tk.END)
 
         lb.bind("<<ListboxSelect>>", on_select)
-        lb.bind("<Double-Button-1>", lambda e: do_save())
 
-        def selected_link():
+        def current_link():
             sel = lb.curselection()
             if not sel or not items:
                 return None, -1
@@ -2822,83 +2942,153 @@ class OnePDFEditor(tk.Tk):
             return items[i], i
 
         def do_save():
-            lk, i = selected_link()
+            lk, i = current_link()
             if lk is None:
-                messagebox.showinfo("Select link", "First click a link in the list.", parent=win)
+                messagebox.showinfo("Select", "Select a link from the list first.", parent=win)
                 return
             new_uri = url_var.get().strip()
             if not new_uri:
-                messagebox.showinfo("URL", "Type the new URL in the box.", parent=win)
+                messagebox.showinfo("URL", "Type a URL in the box.", parent=win)
                 return
             ok, msg = self.pdf.update_link_uri(page_idx, lk, new_uri)
             if ok:
                 self.render_page()
-                refresh_list(select_idx=i)
-                self.status.config(text=msg)
-                messagebox.showinfo("Saved", "Link URL updated.\nRemember File → Save.", parent=win)
+                refresh(select=i)
+                self.status.config(text=msg + " — use File → Save")
+                messagebox.showinfo("Updated", "Link URL saved in memory.\nPress File → Save to write the PDF.", parent=win)
             else:
                 messagebox.showerror("Failed", msg, parent=win)
 
         def do_delete():
-            lk, i = selected_link()
+            lk, i = current_link()
             if lk is None:
-                messagebox.showinfo("Select link", "Select a link first.", parent=win)
+                messagebox.showinfo("Select", "Select a link first.", parent=win)
                 return
             if not messagebox.askyesno("Delete", "Remove this hyperlink?", parent=win):
                 return
             ok, msg = self.pdf.delete_link(page_idx, lk)
             if ok:
                 self.render_page()
-                refresh_list()
+                refresh(select=0)
                 self.status.config(text=msg)
             else:
                 messagebox.showerror("Failed", msg, parent=win)
 
-        def do_add():
+        def do_add_area():
             win.destroy()
+            self.link_edit_mode = False
             self.start_add_hyperlink()
 
-        def do_add_on_text():
+        def do_add_text():
             win.destroy()
+            self.link_edit_mode = False
             self.add_link_to_selected_text()
 
+        def do_close():
+            self.link_edit_mode = False
+            try:
+                self.canvas.config(cursor="")
+            except Exception:
+                pass
+            self.render_page()
+            win.destroy()
+
+        # Buttons — always visible at bottom
         bf = tk.Frame(win, bg=COLORS["surface"])
-        bf.pack(fill=tk.X, padx=12, pady=12)
+        bf.pack(fill=tk.X, padx=16, pady=16)
         tk.Button(
             bf, text="Save URL", command=do_save,
-            bg=COLORS["accent"], fg="white", relief=tk.FLAT, padx=14, pady=6,
-            font=("Segoe UI", 10, "bold"), cursor="hand2",
-        ).pack(side=tk.LEFT, padx=3)
+            bg=COLORS["accent"], fg="white", relief=tk.FLAT,
+            font=("Segoe UI", 10, "bold"), padx=16, pady=8, cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 6))
         tk.Button(
-            bf, text="Delete Link", command=do_delete,
-            bg="#ef4444", fg="white", relief=tk.FLAT, padx=10, pady=6,
-            font=("Segoe UI", 9), cursor="hand2",
-        ).pack(side=tk.LEFT, padx=3)
+            bf, text="Delete", command=do_delete,
+            bg="#ef4444", fg="white", relief=tk.FLAT,
+            font=("Segoe UI", 9), padx=12, pady=8, cursor="hand2",
+        ).pack(side=tk.LEFT, padx=4)
         tk.Button(
-            bf, text="Add New Link…", command=do_add,
-            bg=COLORS["surface2"], fg=COLORS["text"], relief=tk.FLAT, padx=10, pady=6,
-            font=("Segoe UI", 9), cursor="hand2",
-        ).pack(side=tk.LEFT, padx=3)
+            bf, text="Add New (draw)", command=do_add_area,
+            bg=COLORS["surface2"], fg=COLORS["text"], relief=tk.FLAT,
+            font=("Segoe UI", 9), padx=10, pady=8, cursor="hand2",
+        ).pack(side=tk.LEFT, padx=4)
         tk.Button(
-            bf, text="Link on Selected Text…", command=do_add_on_text,
-            bg=COLORS["surface2"], fg=COLORS["text"], relief=tk.FLAT, padx=10, pady=6,
-            font=("Segoe UI", 9), cursor="hand2",
-        ).pack(side=tk.LEFT, padx=3)
+            bf, text="Add on Text", command=do_add_text,
+            bg=COLORS["surface2"], fg=COLORS["text"], relief=tk.FLAT,
+            font=("Segoe UI", 9), padx=10, pady=8, cursor="hand2",
+        ).pack(side=tk.LEFT, padx=4)
         tk.Button(
-            bf, text="Close", command=win.destroy,
-            bg=COLORS["surface2"], fg=COLORS["text_dim"], relief=tk.FLAT, padx=10, pady=6,
-            font=("Segoe UI", 9), cursor="hand2",
-        ).pack(side=tk.RIGHT, padx=3)
+            bf, text="Close", command=do_close,
+            bg=COLORS["surface2"], fg=COLORS["text_dim"], relief=tk.FLAT,
+            font=("Segoe UI", 9), padx=12, pady=8, cursor="hand2",
+        ).pack(side=tk.RIGHT)
 
-        refresh_list(0 if links else None)
-        if items:
-            lb.selection_set(0)
-            on_select()
+        win.protocol("WM_DELETE_WINDOW", do_close)
+        win.bind("<Return>", lambda e: do_save())
+        refresh(0)
+        url_entry.focus_set()
+
+    def _edit_link_at(self, page_idx, pt):
+        """Click link on page while link_edit_mode: open same URL editor."""
+        try:
+            links = self.pdf.get_page_links(page_idx)
+        except Exception:
+            return False
+        hit = None
+        for lk in links:
+            try:
+                if fitz.Rect(lk.get("from")).contains(pt):
+                    hit = lk
+                    break
+            except Exception:
+                continue
+        if not hit:
+            return False
+        # Reuse small dialog
+        cur = (hit.get("uri") or "").strip()
+        win = tk.Toplevel(self)
+        win.title("Edit Hyperlink")
+        win.configure(bg=COLORS["surface"])
+        win.minsize(420, 160)
+        win.geometry("500x200")
+        win.transient(self)
+        tk.Label(
+            win, text="URL (text on page will not change):",
+            bg=COLORS["surface"], fg=COLORS["text"], font=("Segoe UI", 10),
+        ).pack(anchor=tk.W, padx=16, pady=(16, 6))
+        var = tk.StringVar(value=cur)
+        ent = tk.Entry(
+            win, textvariable=var, font=("Segoe UI", 12),
+            bg="#1e1e2e", fg="#f8f8ff", insertbackground="#f8f8ff",
+            relief=tk.SOLID, bd=1,
+        )
+        ent.pack(fill=tk.X, padx=16, ipady=10)
+        ent.focus_set()
+        ent.selection_range(0, tk.END)
+        bf = tk.Frame(win, bg=COLORS["surface"])
+        bf.pack(fill=tk.X, padx=16, pady=16)
+
+        def save():
+            new_uri = var.get().strip()
+            if not new_uri:
+                return
+            ok, msg = self.pdf.update_link_uri(page_idx, hit, new_uri)
+            if ok:
+                self.render_page()
+                self.status.config(text=msg + " — File → Save")
+                win.destroy()
+            else:
+                messagebox.showerror("Failed", msg, parent=win)
+
+        tk.Button(bf, text="Save Link", command=save, bg=COLORS["accent"], fg="white",
+                  relief=tk.FLAT, padx=14, pady=8, font=("Segoe UI", 10, "bold"), cursor="hand2").pack(side=tk.LEFT)
+        tk.Button(bf, text="Cancel", command=win.destroy, bg=COLORS["surface2"], fg=COLORS["text"],
+                  relief=tk.FLAT, padx=12, pady=8, font=("Segoe UI", 9), cursor="hand2").pack(side=tk.RIGHT)
+        win.bind("<Return>", lambda e: save())
+        return True
 
     def add_link_to_selected_text(self):
         """Make the currently selected text span a clickable hyperlink."""
-        if not self.pdf.doc:
-            messagebox.showinfo("No file", "Open a PDF first.", parent=self)
+        if not self._require_edit_mode("add link on text"):
             return
         if not self.selected_span or self.selected_page < 0:
             messagebox.showinfo(
@@ -2929,10 +3119,10 @@ class OnePDFEditor(tk.Tk):
             messagebox.showerror("Link failed", msg, parent=self)
 
     def start_add_hyperlink(self):
-        if not self.pdf.doc:
-            messagebox.showinfo("No file", "Open a PDF first.", parent=self)
+        if not self._require_edit_mode("add hyperlinks"):
             return
         self._cancel_ops()
+        self.link_edit_mode = False
         self.link_mode = True
         self.link_rect = None
         try:
@@ -2959,6 +3149,7 @@ class OnePDFEditor(tk.Tk):
         rect = fitz.Rect(self.link_rect)
         self.link_mode = False
         self.link_rect = None
+        self.link_edit_mode = False
         try:
             self.canvas.config(cursor="")
         except Exception:
@@ -3072,6 +3263,7 @@ class OnePDFEditor(tk.Tk):
         self.screenshot_mode = False
         self.link_mode = False
         self.link_rect = None
+        self.link_edit_mode = False
         self.placing_symbol = False
         self.symbol_char = None
         self.fill_rect = None
