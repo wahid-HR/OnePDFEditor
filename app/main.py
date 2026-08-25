@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-One PDF Editor v1.0
+One PDF Editor v1.5
 Made by Yumdrop Tech. Studio – 2026
 Offline PDF / Image / Document viewer & editor for Windows.
 """
@@ -1160,8 +1160,8 @@ class PDFMergerWindow(tk.Toplevel):
         self.parent_app = parent
         self.title("PDF Merger — One PDF Editor")
         self.configure(bg=COLORS["surface"])
-        self.geometry("780x520")
-        self.minsize(640, 420)
+        self.geometry("860x560")
+        self.minsize(720, 480)
         self.transient(parent)
         self.files = []  # list of {"path", "pages", "name"}
         self._thumb = None
@@ -1209,17 +1209,21 @@ class PDFMergerWindow(tk.Toplevel):
                 relief=tk.FLAT, padx=8, pady=4, font=("Segoe UI", 9), cursor="hand2",
             ).pack(side=tk.LEFT, padx=3)
 
-        right = tk.Frame(body, bg=COLORS["surface"], width=260)
+        right = tk.Frame(body, bg=COLORS["surface"], width=280)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
         right.pack_propagate(False)
         tk.Label(right, text="Preview", bg=COLORS["surface"], fg=COLORS["text_dim"],
                  font=("Segoe UI", 9)).pack(anchor=tk.W)
+        # Info fixed at bottom so page count never gets clipped
+        self.info_lbl = tk.Label(
+            right, text="", bg=COLORS["surface2"], fg=COLORS["text"],
+            font=("Segoe UI", 10), justify=tk.LEFT, wraplength=260,
+            anchor=tk.NW, padx=8, pady=8,
+        )
+        self.info_lbl.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         self.preview_lbl = tk.Label(right, bg="#0b1220", text="No file selected",
                                     fg=COLORS["text_dim"], font=("Segoe UI", 9))
-        self.preview_lbl.pack(fill=tk.BOTH, expand=True, pady=4)
-        self.info_lbl = tk.Label(right, text="", bg=COLORS["surface"], fg=COLORS["text"],
-                                 font=("Segoe UI", 9), justify=tk.LEFT, wraplength=240)
-        self.info_lbl.pack(anchor=tk.W, pady=4)
+        self.preview_lbl.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=4)
 
         bottom = tk.Frame(self, bg=COLORS["surface"])
         bottom.pack(fill=tk.X, padx=12, pady=12)
@@ -1347,9 +1351,23 @@ class PDFMergerWindow(tk.Toplevel):
         if i is None or i >= len(self.files):
             return
         f = self.files[i]
-        self.info_lbl.config(
-            text=f"#{i + 1} in order\n[{f.get('kind','PDF')}] {f['name']}\n{f['pages']} page(s)\n(auto→PDF on merge)\n\n{f['path']}"
-        )
+        pages = int(f.get("pages") or 0)
+        page_word = "page" if pages == 1 else "pages"
+        name = f.get("name") or ""
+        if len(name) > 36:
+            name = name[:33] + "..."
+        path_show = f.get("path") or ""
+        if len(path_show) > 42:
+            path_show = "..." + path_show[-39:]
+        info = (
+            "Order: #%d\n"
+            "Type: [%s]\n"
+            "File: %s\n"
+            "Pages: %d %s\n"
+            "(auto → PDF on merge)\n"
+            "%s"
+        ) % (i + 1, f.get("kind", "PDF"), name, pages, page_word, path_show)
+        self.info_lbl.config(text=info)
         try:
             doc = self._open_as_pdf_doc(f["path"])
             page = doc[0]
@@ -1420,6 +1438,439 @@ class TabSession:
         self.selected_span = None
         self.selected_page = -1
         self.scroll_y = 0.0  # canvas yview fraction
+
+
+
+class DocumentScannerWindow(tk.Toplevel):
+    """CamScanner-style document scanner: import/camera, enhance, crop, multi-page → PDF."""
+
+    FILTERS = ("Original", "Enhance", "B&W", "B&W Strong", "Magic Color")
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_app = parent
+        self.title("Document Scanner — One PDF Editor")
+        self.configure(bg=COLORS["surface"])
+        self.geometry("920x620")
+        self.minsize(780, 520)
+        self.transient(parent)
+        self.pages = []  # list of PIL Image (RGB)
+        self.current = -1
+        self.source_img = None  # working image before crop bake
+        self.display_img = None
+        self._photo = None
+        self.crop_mode = False
+        self.crop_start = None
+        self.crop_rect = None
+        self.filter_name = "Enhance"
+        self.rotation = 0
+        self._build()
+
+    def _build(self):
+        top = tk.Frame(self, bg=COLORS["surface"])
+        top.pack(fill=tk.X, padx=12, pady=10)
+        tk.Label(top, text="Document Scanner", bg=COLORS["surface"], fg=COLORS["text"],
+                 font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
+        tk.Label(top, text="Import · Camera · Enhance · Crop · Multi-page PDF",
+                 bg=COLORS["surface"], fg=COLORS["text_dim"], font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=12)
+
+        body = tk.Frame(self, bg=COLORS["surface"])
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+
+        # Left: page list
+        left = tk.Frame(body, bg=COLORS["surface"], width=180)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        left.pack_propagate(False)
+        tk.Label(left, text="Pages", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Segoe UI", 9)).pack(anchor=tk.W)
+        self.listbox = tk.Listbox(
+            left, bg=COLORS["surface2"], fg=COLORS["text"], selectbackground=COLORS["accent"],
+            font=("Segoe UI", 10), relief=tk.FLAT, activestyle="none", highlightthickness=0,
+        )
+        self.listbox.pack(fill=tk.BOTH, expand=True, pady=4)
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+        lf_btns = tk.Frame(left, bg=COLORS["surface"])
+        lf_btns.pack(fill=tk.X)
+        for t, c in [("↑", self.move_up), ("↓", self.move_down), ("✕", self.remove_page)]:
+            tk.Button(lf_btns, text=t, command=c, bg=COLORS["surface2"], fg=COLORS["text"],
+                      relief=tk.FLAT, padx=8, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=2)
+
+        # Center: canvas preview
+        mid = tk.Frame(body, bg=COLORS["surface"])
+        mid.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        self.canvas = tk.Canvas(mid, bg="#0b1220", highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.bind("<Button-1>", self._on_down)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_up)
+        self.canvas.bind("<Configure>", lambda e: self._redraw())
+
+        # Right: tools
+        right = tk.Frame(body, bg=COLORS["surface"], width=200)
+        right.pack(side=tk.RIGHT, fill=tk.Y)
+        right.pack_propagate(False)
+        tk.Label(right, text="Tools", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Segoe UI", 9)).pack(anchor=tk.W)
+        for text, cmd in [
+            ("📷 Camera", self.capture_camera),
+            ("📁 Import image", self.import_images),
+            ("↺ Rotate left", lambda: self.rotate(-90)),
+            ("↻ Rotate right", lambda: self.rotate(90)),
+            ("✂ Crop mode", self.toggle_crop),
+            ("✓ Apply crop", self.apply_crop),
+            ("➕ Add page", self.commit_page),
+        ]:
+            tk.Button(
+                right, text=text, command=cmd, bg=COLORS["surface2"], fg=COLORS["text"],
+                relief=tk.FLAT, padx=10, pady=6, font=("Segoe UI", 9), cursor="hand2",
+                anchor=tk.W,
+            ).pack(fill=tk.X, pady=3)
+
+        tk.Label(right, text="Filter", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(12, 2))
+        self.filter_var = tk.StringVar(value="Enhance")
+        for name in self.FILTERS:
+            tk.Radiobutton(
+                right, text=name, variable=self.filter_var, value=name,
+                command=self._apply_filter_preview,
+                bg=COLORS["surface"], fg=COLORS["text"], selectcolor=COLORS["surface2"],
+                activebackground=COLORS["surface"], font=("Segoe UI", 9), anchor=tk.W,
+            ).pack(fill=tk.X)
+
+        bottom = tk.Frame(self, bg=COLORS["surface"])
+        bottom.pack(fill=tk.X, padx=12, pady=12)
+        self.status = tk.Label(
+            bottom, text="Import or capture a document page",
+            bg=COLORS["surface"], fg=COLORS["text_dim"], font=("Segoe UI", 9),
+        )
+        self.status.pack(side=tk.LEFT)
+        tk.Button(
+            bottom, text="Save PDF…", command=self.save_pdf,
+            bg=COLORS["accent"], fg="white", relief=tk.FLAT, padx=16, pady=8,
+            font=("Segoe UI", 10, "bold"), cursor="hand2",
+        ).pack(side=tk.RIGHT, padx=4)
+        tk.Button(
+            bottom, text="Open in Editor", command=self.open_in_editor,
+            bg=COLORS["surface2"], fg=COLORS["text"], relief=tk.FLAT, padx=12, pady=8,
+            font=("Segoe UI", 9), cursor="hand2",
+        ).pack(side=tk.RIGHT, padx=4)
+
+    def import_images(self):
+        paths = filedialog.askopenfilenames(
+            parent=self,
+            title="Import scanned images",
+            filetypes=[
+                ("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        for path in paths:
+            try:
+                img = Image.open(path)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                self.source_img = img
+                self.rotation = 0
+                self.filter_var.set("Enhance")
+                self._apply_filter_preview()
+                self.commit_page()
+            except Exception as e:
+                messagebox.showerror("Import failed", f"{path}\n{e}", parent=self)
+        self.status.config(text=f"{len(self.pages)} page(s) in scan")
+
+    def capture_camera(self):
+        if not HAS_CV2:
+            messagebox.showinfo(
+                "Camera",
+                "OpenCV not available in this build.\n\nUse Import image instead\n(or install opencv-python and rebuild).",
+                parent=self,
+            )
+            return
+        try:
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                messagebox.showerror("Camera", "Could not open webcam.", parent=self)
+                return
+            win = tk.Toplevel(self)
+            win.title("Camera — click Capture")
+            win.configure(bg=COLORS["surface"])
+            lbl = tk.Label(win, bg="#000")
+            lbl.pack(padx=8, pady=8)
+            state = {"photo": None, "frame": None, "running": True}
+
+            def update():
+                if not state["running"]:
+                    return
+                ok, frame = cap.read()
+                if ok:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    state["frame"] = frame
+                    im = Image.fromarray(frame)
+                    im.thumbnail((640, 480), Image.Resampling.LANCZOS)
+                    state["photo"] = ImageTk.PhotoImage(im)
+                    lbl.config(image=state["photo"])
+                win.after(30, update)
+
+            def do_capture():
+                if state["frame"] is None:
+                    return
+                img = Image.fromarray(state["frame"]).convert("RGB")
+                state["running"] = False
+                cap.release()
+                win.destroy()
+                self.source_img = img
+                self.rotation = 0
+                self.filter_var.set("Enhance")
+                self._apply_filter_preview()
+                self.status.config(text="Captured — adjust filter/crop, then Add page")
+
+            def on_close():
+                state["running"] = False
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                win.destroy()
+
+            bf = tk.Frame(win, bg=COLORS["surface"])
+            bf.pack(fill=tk.X, padx=8, pady=8)
+            tk.Button(bf, text="Capture", command=do_capture, bg=COLORS["accent"], fg="white",
+                      relief=tk.FLAT, padx=14, pady=6, cursor="hand2").pack(side=tk.LEFT)
+            tk.Button(bf, text="Cancel", command=on_close, bg=COLORS["surface2"], fg=COLORS["text"],
+                      relief=tk.FLAT, padx=12, pady=6, cursor="hand2").pack(side=tk.RIGHT)
+            win.protocol("WM_DELETE_WINDOW", on_close)
+            update()
+        except Exception as e:
+            messagebox.showerror("Camera failed", str(e), parent=self)
+
+    def _enhance(self, img, mode):
+        img = img.convert("RGB")
+        if mode == "Original":
+            return img
+        if mode == "Enhance":
+            img = ImageEnhance.Contrast(img).enhance(1.35)
+            img = ImageEnhance.Sharpness(img).enhance(1.4)
+            img = ImageEnhance.Color(img).enhance(1.1)
+            return img
+        if mode == "B&W":
+            g = img.convert("L")
+            g = ImageEnhance.Contrast(g).enhance(1.5)
+            return g.convert("RGB")
+        if mode == "B&W Strong":
+            g = img.convert("L")
+            g = ImageEnhance.Contrast(g).enhance(2.2)
+            g = ImageEnhance.Sharpness(g).enhance(1.5)
+            # simple threshold-ish via point
+            g = g.point(lambda x: 0 if x < 140 else 255)
+            return g.convert("RGB")
+        if mode == "Magic Color":
+            img = ImageEnhance.Color(img).enhance(1.35)
+            img = ImageEnhance.Contrast(img).enhance(1.45)
+            img = ImageEnhance.Sharpness(img).enhance(1.3)
+            return img
+        return img
+
+    def _base_rotated(self):
+        if self.source_img is None:
+            return None
+        img = self.source_img
+        if self.rotation % 360:
+            img = img.rotate(-self.rotation, expand=True)
+        return img
+
+    def _apply_filter_preview(self):
+        base = self._base_rotated()
+        if base is None:
+            return
+        self.display_img = self._enhance(base, self.filter_var.get())
+        self.crop_rect = None
+        self._redraw()
+
+    def rotate(self, deg):
+        if self.source_img is None:
+            return
+        self.rotation = (self.rotation + deg) % 360
+        self._apply_filter_preview()
+
+    def toggle_crop(self):
+        if self.display_img is None:
+            messagebox.showinfo("Crop", "Load or capture an image first.", parent=self)
+            return
+        self.crop_mode = not self.crop_mode
+        self.crop_rect = None
+        self.status.config(text="Crop mode ON — drag on image" if self.crop_mode else "Crop mode OFF")
+        self._redraw()
+
+    def apply_crop(self):
+        if self.display_img is None or not self.crop_rect:
+            messagebox.showinfo("Crop", "Draw a crop rectangle first.", parent=self)
+            return
+        # map canvas rect to image coords
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        iw, ih = self.display_img.size
+        scale = min(cw / iw, ch / ih, 1.0)
+        dw, dh = int(iw * scale), int(ih * scale)
+        ox, oy = (cw - dw) // 2, (ch - dh) // 2
+        x0, y0, x1, y1 = self.crop_rect
+        x0, x1 = sorted([(x0 - ox) / scale, (x1 - ox) / scale])
+        y0, y1 = sorted([(y0 - oy) / scale, (y1 - oy) / scale])
+        x0 = max(0, min(iw - 1, x0))
+        x1 = max(0, min(iw, x1))
+        y0 = max(0, min(ih - 1, y0))
+        y1 = max(0, min(ih, y1))
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            messagebox.showinfo("Crop", "Crop area too small.", parent=self)
+            return
+        cropped = self.display_img.crop((int(x0), int(y0), int(x1), int(y1)))
+        self.source_img = cropped
+        self.rotation = 0
+        self.crop_mode = False
+        self.crop_rect = None
+        self._apply_filter_preview()
+        self.status.config(text="Crop applied")
+
+    def commit_page(self):
+        if self.display_img is None:
+            messagebox.showinfo("Add page", "Nothing to add. Import or capture first.", parent=self)
+            return
+        self.pages.append(self.display_img.copy())
+        self._refresh_list()
+        self.current = len(self.pages) - 1
+        self.listbox.selection_clear(0, tk.END)
+        self.listbox.selection_set(self.current)
+        self.status.config(text=f"Page added — {len(self.pages)} total")
+
+    def _refresh_list(self):
+        self.listbox.delete(0, tk.END)
+        for i in range(len(self.pages)):
+            self.listbox.insert(tk.END, f"Page {i + 1}")
+
+    def _on_select(self, event=None):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        self.current = int(sel[0])
+        img = self.pages[self.current]
+        self.source_img = img.copy()
+        self.rotation = 0
+        self.filter_var.set("Original")
+        self.display_img = img.copy()
+        self.crop_rect = None
+        self._redraw()
+
+    def move_up(self):
+        i = self.current
+        if i is None or i <= 0:
+            return
+        self.pages[i - 1], self.pages[i] = self.pages[i], self.pages[i - 1]
+        self.current = i - 1
+        self._refresh_list()
+        self.listbox.selection_set(self.current)
+
+    def move_down(self):
+        i = self.current
+        if i is None or i >= len(self.pages) - 1:
+            return
+        self.pages[i + 1], self.pages[i] = self.pages[i], self.pages[i + 1]
+        self.current = i + 1
+        self._refresh_list()
+        self.listbox.selection_set(self.current)
+
+    def remove_page(self):
+        if self.current < 0 or self.current >= len(self.pages):
+            return
+        self.pages.pop(self.current)
+        self._refresh_list()
+        self.current = min(self.current, len(self.pages) - 1)
+        if self.pages:
+            self.listbox.selection_set(self.current)
+            self._on_select()
+        else:
+            self.source_img = None
+            self.display_img = None
+            self.canvas.delete("all")
+            self.status.config(text="No pages")
+
+    def _redraw(self):
+        self.canvas.delete("all")
+        if self.display_img is None:
+            return
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        iw, ih = self.display_img.size
+        scale = min(cw / iw, ch / ih, 1.0)
+        dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        shown = self.display_img.resize((dw, dh), Image.Resampling.LANCZOS)
+        self._photo = ImageTk.PhotoImage(shown)
+        ox, oy = (cw - dw) // 2, (ch - dh) // 2
+        self._offset = (ox, oy, scale, dw, dh)
+        self.canvas.create_image(ox, oy, anchor=tk.NW, image=self._photo)
+        if self.crop_rect:
+            x0, y0, x1, y1 = self.crop_rect
+            self.canvas.create_rectangle(x0, y0, x1, y1, outline="#38bdf8", width=2, dash=(4, 2))
+
+    def _on_down(self, event):
+        if not self.crop_mode:
+            return
+        self.crop_start = (event.x, event.y)
+        self.crop_rect = (event.x, event.y, event.x, event.y)
+
+    def _on_drag(self, event):
+        if not self.crop_mode or not self.crop_start:
+            return
+        x0, y0 = self.crop_start
+        self.crop_rect = (x0, y0, event.x, event.y)
+        self._redraw()
+
+    def _on_up(self, event):
+        if not self.crop_mode or not self.crop_start:
+            return
+        x0, y0 = self.crop_start
+        self.crop_rect = (x0, y0, event.x, event.y)
+        self.crop_start = None
+        self._redraw()
+
+    def _pages_to_pdf_path(self, out_path):
+        if not self.pages:
+            raise RuntimeError("No pages")
+        first = self.pages[0].convert("RGB")
+        rest = [p.convert("RGB") for p in self.pages[1:]]
+        first.save(out_path, "PDF", resolution=150.0, save_all=bool(rest), append_images=rest)
+
+    def save_pdf(self):
+        if not self.pages:
+            messagebox.showinfo("No pages", "Add at least one scanned page.", parent=self)
+            return
+        out = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save scan as PDF",
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf")],
+        )
+        if not out:
+            return
+        try:
+            self._pages_to_pdf_path(out)
+            self.status.config(text=f"Saved: {out}")
+            messagebox.showinfo("Saved", f"Scan saved as PDF:\n{out}\n\n{len(self.pages)} page(s)", parent=self)
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e), parent=self)
+
+    def open_in_editor(self):
+        if not self.pages:
+            messagebox.showinfo("No pages", "Add pages first.", parent=self)
+            return
+        try:
+            tmp = Path(tempfile.gettempdir()) / f"OnePDF_scan_{os.getpid()}.pdf"
+            self._pages_to_pdf_path(str(tmp))
+            self.parent_app._load_path(str(tmp))
+            self.status.config(text="Opened scan in editor")
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Open failed", str(e), parent=self)
 
 
 class OnePDFEditor(tk.Tk):
@@ -1573,6 +2024,10 @@ class OnePDFEditor(tk.Tk):
         tools_m.add_command(label="OCR Image Text...", command=self.ocr_current_page)
         tools_m.add_separator()
         tools_m.add_command(label="PDF Merger...", command=self.open_pdf_merger)
+        tools_m.add_command(label="Document Scanner...", command=self.open_document_scanner)
+        tools_m.add_command(label="Copy All Text (line by line)...", command=self.copy_all_text_lines)
+        tools_m.add_command(label="Copy Letter by Letter (all)...", command=self.copy_text_letter_by_letter)
+        tools_m.add_command(label="Copy Selection Letter by Letter...", command=self.copy_selection_letters)
         tools_m.add_separator()
         tools_m.add_command(label="Hyperlinks on Page...", command=self.manage_hyperlinks)
         tools_m.add_command(label="Add Hyperlink...", command=self.start_add_hyperlink)
@@ -1620,9 +2075,12 @@ class OnePDFEditor(tk.Tk):
         self.btn_edit_mode.config(bg="#0ea5e9", fg="white")
         self._make_tool_btn(row1, "Print", self.print_document).pack(side=tk.LEFT, padx=2)
         self._make_tool_btn(row1, "Merge", self.open_pdf_merger).pack(side=tk.LEFT, padx=2)
+        self._make_tool_btn(row1, "Scanner", self.open_document_scanner).pack(side=tk.LEFT, padx=2)
         tk.Frame(row1, width=8, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
         for text, cmd in [("Undo", self.undo), ("Search", self.show_search)]:
             self._make_tool_btn(row1, text, cmd).pack(side=tk.LEFT, padx=2)
+        self._make_tool_btn(row1, "Copy Text", self.copy_all_text_lines).pack(side=tk.LEFT, padx=2)
+        self._make_tool_btn(row1, "Letters", self.copy_selection_letters).pack(side=tk.LEFT, padx=2)
         self._make_tool_btn(row1, "✓", lambda: self.start_place_symbol("✓")).pack(side=tk.LEFT, padx=2)
         tk.Frame(row1, width=8, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
         for text, cmd in [("Sign", self.start_signature), ("Copy Sign", self.start_copy_sign_region),
@@ -1674,12 +2132,13 @@ class OnePDFEditor(tk.Tk):
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
-        try:
-            import windnd
-            # Hook only once on the main window (canvas double-hook can crash)
-            windnd.hook_dropfiles(self, func=self._on_windnd_drop)
-        except Exception:
-            pass
+        # Drag-drop: windnd is Windows-only
+        if sys.platform.startswith("win"):
+            try:
+                import windnd
+                windnd.hook_dropfiles(self, func=self._on_windnd_drop)
+            except Exception:
+                pass
         self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
         self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
 
@@ -1713,8 +2172,19 @@ class OnePDFEditor(tk.Tk):
         self.bind("<Control-Shift-S>", lambda e: self.save_as_pdf())
         self.bind("<Control-Shift-s>", lambda e: self.save_as_pdf())
         self.bind("<Control-f>", lambda e: self.show_search())
+        self.bind("<Control-Shift-c>", lambda e: self.copy_all_text_lines())
+        self.bind("<Control-Shift-C>", lambda e: self.copy_all_text_lines())
         self.bind("<Control-z>", lambda e: self.undo())
         self.bind("<Control-y>", lambda e: self.redo())
+        # macOS Command key
+        self.bind("<Command-o>", lambda e: self.open_file())
+        self.bind("<Command-p>", lambda e: self.print_document())
+        self.bind("<Command-w>", lambda e: self.close_tab())
+        self.bind("<Command-s>", lambda e: self.save_pdf())
+        self.bind("<Command-Shift-s>", lambda e: self.save_as_pdf())
+        self.bind("<Command-f>", lambda e: self.show_search())
+        self.bind("<Command-z>", lambda e: self.undo())
+        self.bind("<Command-y>", lambda e: self.redo())
         self.bind("<Escape>", lambda e: self._cancel_ops())
         self.bind("<Prior>", lambda e: self.prev_page())
         self.bind("<Next>", lambda e: self.next_page())
@@ -2284,7 +2754,25 @@ class OnePDFEditor(tk.Tk):
                         r0.x1 + self._move_delta[0], r0.y1 + self._move_delta[1],
                     )
                 r = canvas_rect(self.selected_page, r0)
-                self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#4ade80", width=2, tags="selected")
+                # Black highlight — text stays visible by redrawing in bright color on top
+                self.canvas.create_rectangle(
+                    r.x0, r.y0, r.x1, r.y1,
+                    outline="#fbbf24", width=2, fill="#0a0a0a", tags="selected",
+                )
+                try:
+                    t = (self.selected_span.get("text") or "").strip()
+                    if t:
+                        fs = max(9, int(float(self.selected_span.get("size") or 11) * self.zoom))
+                        self.canvas.create_text(
+                            r.x0 + 2, r.y0 + 1,
+                            anchor=tk.NW,
+                            text=t,
+                            fill="#fde68a",
+                            font=("Segoe UI", fs),
+                            tags="selected_text",
+                        )
+                except Exception:
+                    pass
             if self.placing_signature and self.sig_rect:
                 r = canvas_rect(self.current_page, self.sig_rect)
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#7c5cff", width=2, dash=(4, 2), tags="sigpreview")
@@ -3892,6 +4380,160 @@ class OnePDFEditor(tk.Tk):
     def open_pdf_merger(self):
         PDFMergerWindow(self)
 
+    def open_document_scanner(self):
+        DocumentScannerWindow(self)
+
+
+
+    def copy_text_letter_by_letter(self, only_selection=False):
+        """Copy text character by character (each letter on its own line)."""
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a file first.", parent=self)
+            return
+        try:
+            chars = []
+            if only_selection and self.selected_span:
+                raw = self.selected_span.get("text") or ""
+                for ch in raw:
+                    if ch == "\n":
+                        chars.append("")  # keep line break as blank line
+                    elif ch == " ":
+                        chars.append("␠")  # visible space marker optional — use real space
+                        chars[-1] = " "
+                    else:
+                        chars.append(ch)
+                label = "selection"
+            else:
+                n = self.pdf.page_count()
+                for pi in range(n):
+                    page = self.pdf.get_page(pi)
+                    if not page:
+                        continue
+                    if n > 1:
+                        chars.append(f"--- Page {pi + 1} ---")
+                    try:
+                        blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT).get("blocks", [])
+                        for b in blocks:
+                            if b.get("type", 0) != 0:
+                                continue
+                            for ln in b.get("lines", []):
+                                line = "".join((sp.get("text") or "") for sp in ln.get("spans", []))
+                                for ch in line:
+                                    chars.append(ch if ch != "" else "")
+                                chars.append("")  # end of visual line
+                    except Exception:
+                        for ch in (page.get_text("text") or ""):
+                            if ch == "\n":
+                                chars.append("")
+                            else:
+                                chars.append(ch)
+                label = "document"
+            # Build clipboard: one character per line (spaces kept as single space line)
+            out_lines = []
+            for ch in chars:
+                if ch.startswith("--- Page"):
+                    out_lines.append(ch)
+                elif ch == "":
+                    out_lines.append("")
+                else:
+                    out_lines.append(ch)
+            text = "\n".join(out_lines)
+            if not any(x.strip() and not x.startswith("---") for x in out_lines):
+                messagebox.showinfo("No text", "No text to copy.", parent=self)
+                return
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            try:
+                self.update()
+            except Exception:
+                pass
+            nch = sum(1 for x in out_lines if len(x) == 1 or (len(x) == 1))
+            # count real letters
+            nch = sum(1 for x in out_lines if x and not x.startswith("---"))
+            self.status.config(text=f"Copied {nch} character(s) letter-by-letter ({label})")
+            messagebox.showinfo(
+                "Copied letter by letter",
+                f"Copied from {label}.\nEach letter is on its own line.\n\nPaste with Ctrl+V.",
+                parent=self,
+            )
+        except Exception as e:
+            messagebox.showerror("Copy failed", str(e), parent=self)
+
+    def copy_selection_letters(self):
+        if not self.selected_span:
+            messagebox.showinfo(
+                "Select text",
+                "First click a text line so it is highlighted,\nthen copy letter by letter.",
+                parent=self,
+            )
+            return
+        self.copy_text_letter_by_letter(only_selection=True)
+
+    def copy_all_text_lines(self):
+        """Copy every text line from the open document to the clipboard (line by line)."""
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a PDF / file first.", parent=self)
+            return
+        try:
+            lines = []
+            n = self.pdf.page_count()
+            for pi in range(n):
+                page = self.pdf.get_page(pi)
+                if not page:
+                    continue
+                # Prefer structured lines so each visual line is separate
+                try:
+                    blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT).get("blocks", [])
+                    page_lines = []
+                    for b in blocks:
+                        if b.get("type", 0) != 0:
+                            continue
+                        for ln in b.get("lines", []):
+                            parts = []
+                            for sp in ln.get("spans", []):
+                                t = sp.get("text") or ""
+                                if t:
+                                    parts.append(t)
+                            line = "".join(parts).rstrip()
+                            if line.strip():
+                                page_lines.append(line)
+                    if page_lines:
+                        if n > 1:
+                            lines.append(f"--- Page {pi + 1} ---")
+                        lines.extend(page_lines)
+                        lines.append("")  # blank between pages
+                    else:
+                        raw = (page.get_text("text") or "").splitlines()
+                        if n > 1:
+                            lines.append(f"--- Page {pi + 1} ---")
+                        lines.extend([x for x in raw if x.strip()])
+                        lines.append("")
+                except Exception:
+                    raw = (page.get_text("text") or "").splitlines()
+                    if n > 1:
+                        lines.append(f"--- Page {pi + 1} ---")
+                    lines.extend([x for x in raw if x.strip()])
+                    lines.append("")
+            text = "\n".join(lines).strip() + ("\n" if lines else "")
+            if not text.strip():
+                messagebox.showinfo("No text", "No extractable text found in this file.", parent=self)
+                return
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            try:
+                self.update()  # ensure clipboard kept on some Windows setups
+            except Exception:
+                pass
+            line_count = sum(1 for x in text.splitlines() if x.strip() and not x.startswith("--- Page"))
+            self.status.config(text=f"Copied {line_count} text line(s) from {n} page(s) to clipboard")
+            messagebox.showinfo(
+                "Copied",
+                f"Copied {line_count} line(s) from {n} page(s).\n\nPaste anywhere with Ctrl+V.",
+                parent=self,
+            )
+        except Exception as e:
+            messagebox.showerror("Copy failed", str(e), parent=self)
+
     def print_document(self):
         """Open Windows print dialog for the current PDF."""
         if not self.pdf.doc:
@@ -3902,7 +4544,16 @@ class OnePDFEditor(tk.Tk):
             self.pdf.doc.save(str(tmp), garbage=1, deflate=True)
             path = str(tmp)
             if not sys.platform.startswith("win"):
-                messagebox.showinfo("Print", f"Saved print copy to:\n{path}", parent=self)
+                try:
+                    import subprocess
+                    if sys.platform == "darwin":
+                        subprocess.Popen(["open", path])
+                        self.status.config(text="Opened in Preview — use File → Print (Cmd+P)")
+                    else:
+                        subprocess.Popen(["xdg-open", path])
+                        self.status.config(text="Opened PDF — print from viewer")
+                except Exception as e:
+                    messagebox.showinfo("Print", f"Saved print copy to:\n{path}\n\n{e}", parent=self)
                 return
             opened = False
             # 1) ShellExecute Print verb
