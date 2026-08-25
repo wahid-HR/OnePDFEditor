@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-One PDF Editor v1.5
+One PDF Editor v1.0
 Made by Yumdrop Tech. Studio – 2026
 Offline PDF / Image / Document viewer & editor for Windows.
 """
@@ -1885,6 +1885,11 @@ class OnePDFEditor(tk.Tk):
         self.tabs = []  # list[TabSession]
         self.edit_mode = False
         self.link_edit_mode = False
+        self.selected_text = ""
+        self.select_rects = []
+        self._text_selecting = False
+        self._sel_start = None
+        self._sel_end = None
         self._drop_queue = queue.Queue()
         self._drop_busy = False
         self.active_tab = -1
@@ -1996,6 +2001,7 @@ class OnePDFEditor(tk.Tk):
 
         edit_m = tk.Menu(menubar, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"], activebackground=COLORS["accent"])
         menubar.add_cascade(label="Edit", menu=edit_m)
+        edit_m.add_command(label="Copy\tCtrl+C", command=self.copy_selection)
         edit_m.add_command(label="Undo\tCtrl+Z", command=self.undo)
         edit_m.add_command(label="Redo\tCtrl+Y", command=self.redo)
         edit_m.add_command(label="Search...\tCtrl+F", command=self.show_search)
@@ -2172,6 +2178,8 @@ class OnePDFEditor(tk.Tk):
         self.bind("<Control-Shift-S>", lambda e: self.save_as_pdf())
         self.bind("<Control-Shift-s>", lambda e: self.save_as_pdf())
         self.bind("<Control-f>", lambda e: self.show_search())
+        self.bind("<Control-c>", lambda e: self.copy_selection())
+        self.bind("<Control-C>", lambda e: self.copy_selection())
         self.bind("<Control-Shift-c>", lambda e: self.copy_all_text_lines())
         self.bind("<Control-Shift-C>", lambda e: self.copy_all_text_lines())
         self.bind("<Control-z>", lambda e: self.undo())
@@ -2746,6 +2754,17 @@ class OnePDFEditor(tk.Tk):
             if self.highlight_rect is not None:
                 r = canvas_rect(self.current_page, self.highlight_rect)
                 self.canvas.create_rectangle(r.x0, r.y0, r.x1, r.y1, outline="#fbbf24", width=2, tags="highlight")
+            # Drag-selected text highlights (View mode)
+            if self.select_rects:
+                for br in self.select_rects:
+                    try:
+                        r = canvas_rect(self.current_page, br)
+                        self.canvas.create_rectangle(
+                            r.x0, r.y0, r.x1, r.y1,
+                            outline="", fill="#2563eb", stipple="gray50", tags="textsel",
+                        )
+                    except Exception:
+                        pass
             if self.selected_span and self.selected_page is not None:
                 r0 = fitz.Rect(self.selected_span["bbox"])
                 if self._move_active and self._move_delta:
@@ -2832,6 +2851,73 @@ class OnePDFEditor(tk.Tk):
             pass
         return fitz.Point(x / self.zoom, local_y / self.zoom)
 
+
+    def clear_text_selection(self):
+        self.selected_text = ""
+        self.select_rects = []
+        self._text_selecting = False
+        self._sel_start = None
+        self._sel_end = None
+
+    def _collect_text_in_rect(self, page_idx, rect):
+        """Return (text, list of fitz.Rect) for characters intersecting rect."""
+        page = self.pdf.get_page(page_idx)
+        if not page:
+            return "", []
+        r = fitz.Rect(rect)
+        r.normalize()
+        if r.is_empty or r.width < 1 or r.height < 1:
+            return "", []
+        chars_out = []
+        boxes = []
+        try:
+            data = page.get_text("rawdict", flags=fitz.TEXTFLAGS_TEXT)
+            for block in data.get("blocks", []):
+                if block.get("type", 0) != 0:
+                    continue
+                for line in block.get("lines", []):
+                    line_chars = []
+                    for span in line.get("spans", []):
+                        chs = span.get("chars")
+                        if chs:
+                            for ch in chs:
+                                cb = fitz.Rect(ch.get("bbox"))
+                                if cb.intersects(r):
+                                    line_chars.append(ch.get("c") or "")
+                                    boxes.append(cb)
+                        else:
+                            sb = fitz.Rect(span.get("bbox"))
+                            if sb.intersects(r):
+                                t = span.get("text") or ""
+                                if t:
+                                    line_chars.append(t)
+                                    boxes.append(sb)
+                    if line_chars:
+                        chars_out.append("".join(line_chars))
+        except Exception:
+            try:
+                t = (page.get_text("text") or "").strip()
+                if t:
+                    chars_out = [t]
+            except Exception:
+                pass
+        return "\n".join(chars_out).strip(), boxes
+
+    def copy_selection(self, event=None):
+        text = (getattr(self, "selected_text", None) or "").strip()
+        if not text and self.selected_span:
+            text = (self.selected_span.get("text") or "").strip()
+        if not text:
+            self.status.config(text="Nothing selected — drag over text, then Ctrl+C")
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            self.status.config(text=f"Copied {len(text)} character(s) — paste with Ctrl+V")
+        except Exception as e:
+            messagebox.showerror("Copy failed", str(e), parent=self)
+
     def _on_canvas_click(self, event):
         if not self.pdf.doc:
             return
@@ -2890,14 +2976,14 @@ class OnePDFEditor(tk.Tk):
             if self._edit_link_at(self.current_page, pt):
                 return
 
-        # VIEW mode: click link → browser (text stays unchanged)
+        # VIEW mode: drag to select text; short click on link opens browser
         if (not self.edit_mode) and (not tool_busy):
-            if self._open_link_at(self.current_page, pt):
-                return
-            # no text selection in view mode
             self.selected_span = None
-            self.render_page()
-            self.status.config(text="VIEW mode — click a link to open · switch to Edit Mode to change content")
+            self.clear_text_selection()
+            self._sel_start = pt
+            self._sel_end = pt
+            self._text_selecting = True
+            self.status.config(text="Drag to select text · Ctrl+C to copy · click link to open")
             return
 
         # EDIT mode: normal tools / text select
@@ -3064,6 +3150,19 @@ class OnePDFEditor(tk.Tk):
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         pt = self._canvas_to_pdf(cx, cy)
+        # VIEW mode text drag-select
+        if (not self.edit_mode) and getattr(self, "_text_selecting", False) and self._sel_start is not None:
+            self._sel_end = pt
+            rect = fitz.Rect(self._sel_start, self._sel_end)
+            rect.normalize()
+            text, boxes = self._collect_text_in_rect(self.current_page, rect)
+            self.selected_text = text
+            self.select_rects = boxes
+            self.render_page()
+            if text:
+                prev = text if len(text) < 48 else text[:45] + "..."
+                self.status.config(text=f'Selected: "{prev}"  —  Ctrl+C to copy')
+            return
         # Move selected text
         if self._move_active and self.selected_span and self._move_start is not None:
             if not (self.screenshot_mode or self.fill_mode or self.copy_sign_mode or self.placing_signature):
@@ -3098,6 +3197,39 @@ class OnePDFEditor(tk.Tk):
             self.render_page()
 
     def _on_canvas_release(self, event):
+        # VIEW mode: finish text select, or open link on simple click
+        if (not self.edit_mode) and self._text_selecting:
+            cx = self.canvas.canvasx(event.x)
+            cy = self.canvas.canvasy(event.y)
+            pt = self._canvas_to_pdf(cx, cy)
+            self._sel_end = pt
+            self._text_selecting = False
+            moved = False
+            try:
+                if self._sel_start is not None:
+                    moved = abs(pt.x - self._sel_start.x) > 3 or abs(pt.y - self._sel_start.y) > 3
+            except Exception:
+                moved = True
+            if moved and self._sel_start is not None:
+                rect = fitz.Rect(self._sel_start, self._sel_end)
+                rect.normalize()
+                text, boxes = self._collect_text_in_rect(self.current_page, rect)
+                self.selected_text = text
+                self.select_rects = boxes
+                self.render_page()
+                if text:
+                    self.status.config(text=f"Selected {len(text)} chars — Ctrl+C to copy")
+                else:
+                    self.status.config(text="No text in selection")
+            else:
+                # simple click: try hyperlink
+                self.clear_text_selection()
+                if self._open_link_at(self.current_page, pt):
+                    self.render_page()
+                else:
+                    self.render_page()
+                    self.status.config(text="VIEW mode — drag to select text · Ctrl+C copy · click link to open")
+            return
         # Finish text move
         if self._move_active and self.selected_span and self._move_start is not None:
             dx, dy = self._move_delta
