@@ -1518,6 +1518,8 @@ class DocumentScannerWindow(tk.Toplevel):
             ("↻ Rotate right", lambda: self.rotate(90)),
             ("✂ Crop mode", self.toggle_crop),
             ("✓ Apply crop", self.apply_crop),
+            ("📐 Auto crop", self.auto_crop_document),
+            ("straightener Auto align", self.auto_align_document),
             ("➕ Add page", self.commit_page),
         ]:
             tk.Button(
@@ -1526,8 +1528,10 @@ class DocumentScannerWindow(tk.Toplevel):
                 anchor=tk.W,
             ).pack(fill=tk.X, pady=3)
 
-        tk.Label(right, text="Filter", bg=COLORS["surface"], fg=COLORS["text_dim"],
-                 font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(12, 2))
+        tk.Label(right, text="Filter (apply on image)", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(12, 2))
+        tk.Label(right, text="B&W / B&W Strong = black & white", bg=COLORS["surface"],
+                 fg=COLORS["text_dim"], font=("Segoe UI", 8)).pack(anchor=tk.W)
         self.filter_var = tk.StringVar(value="Enhance")
         for name in self.FILTERS:
             tk.Radiobutton(
@@ -1731,6 +1735,127 @@ class DocumentScannerWindow(tk.Toplevel):
         self.crop_rect = None
         self._apply_filter_preview()
         self.status.config(text="Crop applied")
+
+
+    def auto_crop_document(self):
+        """Detect document edges and crop (OpenCV if available, else trim borders)."""
+        base = self._base_rotated()
+        if base is None:
+            messagebox.showinfo("Auto crop", "Import or capture an image first.", parent=self)
+            return
+        try:
+            img = base.convert("RGB")
+            if HAS_CV2:
+                import numpy as np
+                arr = np.array(img)
+                h, w = arr.shape[:2]
+                gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+                gray = cv2.GaussianBlur(gray, (5, 5), 0)
+                edged = cv2.Canny(gray, 50, 150)
+                edged = cv2.dilate(edged, None, iterations=2)
+                cnts, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+                cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:8]
+                doc = None
+                for c in cnts:
+                    peri = cv2.arcLength(c, True)
+                    approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+                    if len(approx) == 4 and cv2.contourArea(approx) > (w * h * 0.12):
+                        doc = approx.reshape(4, 2)
+                        break
+                if doc is not None:
+                    # order points: tl, tr, br, bl
+                    pts = doc.astype("float32")
+                    s = pts.sum(axis=1)
+                    diff = np.diff(pts, axis=1)
+                    tl = pts[np.argmin(s)]
+                    br = pts[np.argmax(s)]
+                    tr = pts[np.argmin(diff)]
+                    bl = pts[np.argmax(diff)]
+                    rect = np.array([tl, tr, br, bl], dtype="float32")
+                    widthA = np.linalg.norm(br - bl)
+                    widthB = np.linalg.norm(tr - tl)
+                    maxW = max(int(widthA), int(widthB), 1)
+                    heightA = np.linalg.norm(tr - br)
+                    heightB = np.linalg.norm(tl - bl)
+                    maxH = max(int(heightA), int(heightB), 1)
+                    dst = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype="float32")
+                    M = cv2.getPerspectiveTransform(rect, dst)
+                    warped = cv2.warpPerspective(arr, M, (maxW, maxH))
+                    img = Image.fromarray(warped)
+                    self.source_img = img
+                    self.rotation = 0
+                    self._apply_filter_preview()
+                    self.status.config(text="Auto crop + perspective align applied")
+                    return
+            # Fallback: trim near-white / near-black borders
+            g = img.convert("L")
+            bw = g.point(lambda x: 0 if x > 245 else 255)
+            bbox = bw.getbbox()
+            if not bbox:
+                bw = g.point(lambda x: 0 if x < 15 else 255)
+                bbox = Image.eval(g, lambda x: 255 if 20 < x < 240 else 0).getbbox()
+            if bbox:
+                # pad slightly
+                x0, y0, x1, y1 = bbox
+                pad = 4
+                x0 = max(0, x0 - pad)
+                y0 = max(0, y0 - pad)
+                x1 = min(img.width, x1 + pad)
+                y1 = min(img.height, y1 + pad)
+                img = img.crop((x0, y0, x1, y1))
+                self.source_img = img
+                self.rotation = 0
+                self._apply_filter_preview()
+                self.status.config(text="Auto crop (border trim) applied")
+            else:
+                messagebox.showinfo("Auto crop", "Could not detect document edges.\nTry manual Crop mode.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Auto crop failed", str(e), parent=self)
+
+    def auto_align_document(self):
+        """Deskew / straighten document page."""
+        base = self._base_rotated()
+        if base is None:
+            messagebox.showinfo("Auto align", "Import or capture an image first.", parent=self)
+            return
+        try:
+            img = base.convert("RGB")
+            angle = 0.0
+            if HAS_CV2:
+                import numpy as np
+                arr = np.array(img)
+                gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+                gray = cv2.bitwise_not(gray)
+                thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+                coords = np.column_stack(np.where(thresh > 0))
+                if len(coords) > 50:
+                    angle = cv2.minAreaRect(coords)[-1]
+                    if angle < -45:
+                        angle = -(90 + angle)
+                    else:
+                        angle = -angle
+                    # limit extreme
+                    if abs(angle) > 15:
+                        angle = max(-15, min(15, angle))
+                    if abs(angle) > 0.3:
+                        (h, w) = arr.shape[:2]
+                        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+                        rotated = cv2.warpAffine(arr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                        img = Image.fromarray(rotated)
+            else:
+                # simple: no cv2 — skip with message
+                messagebox.showinfo(
+                    "Auto align",
+                    "Full deskew needs OpenCV (opencv-python).\nUse Rotate buttons, or rebuild with opencv.",
+                    parent=self,
+                )
+                return
+            self.source_img = img
+            self.rotation = 0
+            self._apply_filter_preview()
+            self.status.config(text=f"Auto align applied (angle {angle:.1f}°)")
+        except Exception as e:
+            messagebox.showerror("Auto align failed", str(e), parent=self)
 
     def commit_page(self):
         if self.display_img is None:
@@ -2133,6 +2258,8 @@ class OnePDFEditor(tk.Tk):
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<Button-3>", self._on_canvas_right_click)
+        self.canvas.bind("<Control-Button-1>", self._on_canvas_right_click)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
@@ -2467,6 +2594,7 @@ class OnePDFEditor(tk.Tk):
             self.selected_span = None
             self._push_ui_to_tab()
             self._refresh_tab_bar()
+            self._text_index_cache = None
             self.set_edit_mode(False)
             self._update_page_ui()
             self.render_page()
@@ -2859,49 +2987,126 @@ class OnePDFEditor(tk.Tk):
         self._sel_start = None
         self._sel_end = None
 
-    def _collect_text_in_rect(self, page_idx, rect):
-        """Return (text, list of fitz.Rect) for characters intersecting rect."""
+    def _text_index(self, page_idx):
+        """Cached line-level text boxes for fast selection (no rawdict every mouse move)."""
+        key = (page_idx, int(self.zoom * 100))
+        cache = getattr(self, "_text_index_cache", None)
+        if cache and cache.get("key") == key:
+            return cache["lines"]
         page = self.pdf.get_page(page_idx)
-        if not page:
-            return "", []
+        lines = []
+        if page:
+            try:
+                data = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
+                for block in data.get("blocks", []):
+                    if block.get("type", 0) != 0:
+                        continue
+                    for line in block.get("lines", []):
+                        parts = []
+                        bbox = None
+                        for span in line.get("spans", []):
+                            t = span.get("text") or ""
+                            if t:
+                                parts.append(t)
+                            sb = fitz.Rect(span.get("bbox"))
+                            bbox = sb if bbox is None else (bbox | sb)
+                        text = "".join(parts)
+                        if text.strip() and bbox is not None:
+                            lines.append({"text": text, "bbox": fitz.Rect(bbox)})
+            except Exception:
+                pass
+        self._text_index_cache = {"key": key, "lines": lines}
+        return lines
+
+    def _collect_text_in_rect(self, page_idx, rect):
         r = fitz.Rect(rect)
         r.normalize()
         if r.is_empty or r.width < 1 or r.height < 1:
             return "", []
         chars_out = []
         boxes = []
+        for line in self._text_index(page_idx):
+            bb = line["bbox"]
+            if bb.intersects(r):
+                chars_out.append(line["text"])
+                boxes.append(bb)
+        return "\n".join(chars_out).strip(), boxes
+
+    def _draw_text_selection_overlay(self):
+        """Update highlight only — do not re-render PDF pages."""
         try:
-            data = page.get_text("rawdict", flags=fitz.TEXTFLAGS_TEXT)
-            for block in data.get("blocks", []):
-                if block.get("type", 0) != 0:
-                    continue
-                for line in block.get("lines", []):
-                    line_chars = []
-                    for span in line.get("spans", []):
-                        chs = span.get("chars")
-                        if chs:
-                            for ch in chs:
-                                cb = fitz.Rect(ch.get("bbox"))
-                                if cb.intersects(r):
-                                    line_chars.append(ch.get("c") or "")
-                                    boxes.append(cb)
-                        else:
-                            sb = fitz.Rect(span.get("bbox"))
-                            if sb.intersects(r):
-                                t = span.get("text") or ""
-                                if t:
-                                    line_chars.append(t)
-                                    boxes.append(sb)
-                    if line_chars:
-                        chars_out.append("".join(line_chars))
+            self.canvas.delete("textsel")
         except Exception:
+            return
+        if not self.select_rects:
+            return
+        off = 0.0
+        for pl in getattr(self, "page_layout", []) or []:
+            if pl["idx"] == self.current_page:
+                off = pl["y0"]
+                break
+        z = self.zoom
+        for br in self.select_rects:
             try:
-                t = (page.get_text("text") or "").strip()
-                if t:
-                    chars_out = [t]
+                r = fitz.Rect(br)
+                self.canvas.create_rectangle(
+                    r.x0 * z, r.y0 * z + off, r.x1 * z, r.y1 * z + off,
+                    outline="#93c5fd", width=1, fill="#3b82f6", stipple="gray25",
+                    tags="textsel",
+                )
             except Exception:
                 pass
-        return "\n".join(chars_out).strip(), boxes
+
+    def _on_canvas_right_click(self, event):
+        if not self.pdf.doc:
+            return
+        try:
+            cx = self.canvas.canvasx(event.x)
+            cy = self.canvas.canvasy(event.y)
+            pt = self._canvas_to_pdf(cx, cy)
+        except Exception:
+            return
+        # gather nearby text
+        hit = ""
+        try:
+            r = fitz.Rect(pt.x - 8, pt.y - 10, pt.x + 220, pt.y + 10)
+            hit, _ = self._collect_text_in_rect(self.current_page, r)
+        except Exception:
+            hit = ""
+        if not hit and self.selected_text:
+            hit = self.selected_text
+        emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", hit or "")
+        phones = re.findall(r"(?:\+?\d[\d\-\s\(\)]{7,}\d)", hit or "")
+        phones = [re.sub(r"[^\d+]", "", p) for p in phones]
+        phones = [p for p in phones if len(re.sub(r"\D", "", p)) >= 7]
+        menu = tk.Menu(self, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"],
+                       activebackground=COLORS["accent"], font=("Segoe UI", 10))
+        if emails:
+            for em in emails[:5]:
+                menu.add_command(label=f"Copy email address  ({em})",
+                                 command=lambda v=em: self._copy_plain(v, "Email copied"))
+        if phones:
+            for ph in phones[:5]:
+                menu.add_command(label=f"Copy number  ({ph})",
+                                 command=lambda v=ph: self._copy_plain(v, "Number copied"))
+        if self.selected_text:
+            menu.add_separator()
+            menu.add_command(label="Copy selected text", command=self.copy_selection)
+        if not emails and not phones and not self.selected_text:
+            menu.add_command(label="No email or number here", state=tk.DISABLED)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_plain(self, text, msg="Copied"):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            self.status.config(text=msg + ": " + text)
+        except Exception:
+            pass
 
     def copy_selection(self, event=None):
         text = (getattr(self, "selected_text", None) or "").strip()
@@ -3150,7 +3355,7 @@ class OnePDFEditor(tk.Tk):
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         pt = self._canvas_to_pdf(cx, cy)
-        # VIEW mode text drag-select
+        # VIEW mode text drag-select (overlay only — no full page redraw)
         if (not self.edit_mode) and getattr(self, "_text_selecting", False) and self._sel_start is not None:
             self._sel_end = pt
             rect = fitz.Rect(self._sel_start, self._sel_end)
@@ -3158,10 +3363,7 @@ class OnePDFEditor(tk.Tk):
             text, boxes = self._collect_text_in_rect(self.current_page, rect)
             self.selected_text = text
             self.select_rects = boxes
-            self.render_page()
-            if text:
-                prev = text if len(text) < 48 else text[:45] + "..."
-                self.status.config(text=f'Selected: "{prev}"  —  Ctrl+C to copy')
+            self._draw_text_selection_overlay()
             return
         # Move selected text
         if self._move_active and self.selected_span and self._move_start is not None:
@@ -3216,7 +3418,7 @@ class OnePDFEditor(tk.Tk):
                 text, boxes = self._collect_text_in_rect(self.current_page, rect)
                 self.selected_text = text
                 self.select_rects = boxes
-                self.render_page()
+                self._draw_text_selection_overlay()
                 if text:
                     self.status.config(text=f"Selected {len(text)} chars — Ctrl+C to copy")
                 else:
@@ -3224,11 +3426,9 @@ class OnePDFEditor(tk.Tk):
             else:
                 # simple click: try hyperlink
                 self.clear_text_selection()
-                if self._open_link_at(self.current_page, pt):
-                    self.render_page()
-                else:
-                    self.render_page()
-                    self.status.config(text="VIEW mode — drag to select text · Ctrl+C copy · click link to open")
+                self._draw_text_selection_overlay()
+                if not self._open_link_at(self.current_page, pt):
+                    self.status.config(text="VIEW mode — drag to select · Ctrl+C copy · right-click email/number")
             return
         # Finish text move
         if self._move_active and self.selected_span and self._move_start is not None:
