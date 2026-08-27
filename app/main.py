@@ -1160,8 +1160,8 @@ class PDFMergerWindow(tk.Toplevel):
         self.parent_app = parent
         self.title("PDF Merger — One PDF Editor")
         self.configure(bg=COLORS["surface"])
-        self.geometry("860x560")
-        self.minsize(720, 480)
+        self.geometry("1020x680")
+        self.minsize(880, 560)
         self.transient(parent)
         self.files = []  # list of {"path", "pages", "name"}
         self._thumb = None
@@ -1209,20 +1209,20 @@ class PDFMergerWindow(tk.Toplevel):
                 relief=tk.FLAT, padx=8, pady=4, font=("Segoe UI", 9), cursor="hand2",
             ).pack(side=tk.LEFT, padx=3)
 
-        right = tk.Frame(body, bg=COLORS["surface"], width=280)
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        right = tk.Frame(body, bg=COLORS["surface"], width=380)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(12, 0))
         right.pack_propagate(False)
         tk.Label(right, text="Preview", bg=COLORS["surface"], fg=COLORS["text_dim"],
                  font=("Segoe UI", 9)).pack(anchor=tk.W)
         # Info fixed at bottom so page count never gets clipped
         self.info_lbl = tk.Label(
             right, text="", bg=COLORS["surface2"], fg=COLORS["text"],
-            font=("Segoe UI", 10), justify=tk.LEFT, wraplength=260,
-            anchor=tk.NW, padx=8, pady=8,
+            font=("Segoe UI", 10), justify=tk.LEFT, wraplength=350,
+            anchor=tk.NW, padx=8, pady=8, height=7,
         )
         self.info_lbl.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         self.preview_lbl = tk.Label(right, bg="#0b1220", text="No file selected",
-                                    fg=COLORS["text_dim"], font=("Segoe UI", 9))
+                                    fg=COLORS["text_dim"], font=("Segoe UI", 10))
         self.preview_lbl.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=4)
 
         bottom = tk.Frame(self, bg=COLORS["surface"])
@@ -1371,10 +1371,11 @@ class PDFMergerWindow(tk.Toplevel):
         try:
             doc = self._open_as_pdf_doc(f["path"])
             page = doc[0]
-            mat = fitz.Matrix(0.35, 0.35)
+            mat = fitz.Matrix(1.0, 1.0)
             pix = page.get_pixmap(matrix=mat, alpha=False)
             img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            img.thumbnail((240, 300), Image.Resampling.LANCZOS)
+            # Fit inside preview pane, keep readable
+            img.thumbnail((360, 480), Image.Resampling.LANCZOS)
             self._thumb = ImageTk.PhotoImage(img)
             self.preview_lbl.config(image=self._thumb, text="")
             doc.close()
