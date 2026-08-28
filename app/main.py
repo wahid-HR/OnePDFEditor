@@ -2158,6 +2158,7 @@ class OnePDFEditor(tk.Tk):
         tools_m.add_command(label="PDF Merger...", command=self.open_pdf_merger)
         tools_m.add_command(label="Document Scanner...", command=self.open_document_scanner)
         tools_m.add_command(label="Copy All Text (line by line)...", command=self.copy_all_text_lines)
+        tools_m.add_command(label="Copy email / number on page...", command=self.copy_contacts_on_page)
         tools_m.add_command(label="Copy Letter by Letter (all)...", command=self.copy_text_letter_by_letter)
         tools_m.add_command(label="Copy Selection Letter by Letter...", command=self.copy_selection_letters)
         tools_m.add_separator()
@@ -2262,6 +2263,12 @@ class OnePDFEditor(tk.Tk):
         self.canvas.bind("<Button-3>", self._on_canvas_right_click)
         self.canvas.bind("<ButtonRelease-3>", self._on_canvas_right_click)
         self.canvas.bind("<Control-Button-1>", self._on_canvas_right_click)
+        self.canvas.bind("<App>", self._on_canvas_right_click)
+        try:
+            self.bind_all("<Button-3>", self._on_global_right_click)
+            self.bind_all("<ButtonRelease-3>", self._on_global_right_click)
+        except Exception:
+            pass
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
@@ -3117,73 +3124,156 @@ class OnePDFEditor(tk.Tk):
             except Exception:
                 pass
 
+    def _on_global_right_click(self, event):
+        w = event.widget
+        try:
+            if str(w) == str(self.canvas) or (hasattr(w, "winfo_containing") is False and w == self.canvas):
+                return self._on_canvas_right_click(event)
+            # if pointer is over canvas
+            x, y = self.winfo_pointerx(), self.winfo_pointery()
+            cx = self.canvas.winfo_rootx()
+            cy = self.canvas.winfo_rooty()
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+            if cx <= x <= cx + cw and cy <= y <= cy + ch:
+                return self._on_canvas_right_click(event)
+        except Exception:
+            pass
+
     def _on_canvas_right_click(self, event):
         if not self.pdf.doc:
-            return
+            try:
+                self.status.config(text="Open a file first, then right-click")
+            except Exception:
+                pass
+            return "break"
         try:
-            cx = self.canvas.canvasx(event.x)
-            cy = self.canvas.canvasy(event.y)
+            self._show_contact_popup(event)
+        except Exception as e:
+            try:
+                messagebox.showerror("Right-click", str(e), parent=self)
+            except Exception:
+                pass
+        return "break"
+
+    def _show_contact_popup(self, event):
+        try:
+            cx = self.canvas.canvasx(self.canvas.winfo_pointerx() - self.canvas.winfo_rootx())
+            cy = self.canvas.canvasy(self.canvas.winfo_pointery() - self.canvas.winfo_rooty())
             pt = self._canvas_to_pdf(cx, cy)
         except Exception:
-            return
+            pt = None
         hit = ""
-        try:
-            hit = self._line_text_at_point(self.current_page, pt)
-        except Exception:
-            hit = ""
+        if pt is not None:
+            try:
+                hit = self._line_text_at_point(self.current_page, pt) or ""
+            except Exception:
+                hit = ""
         extra = (getattr(self, "selected_text", None) or "").strip()
         blob = " ".join(x for x in (hit, extra) if x)
         emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", blob)
         phones = re.findall(r"(?:\+?\d[\d\-\s\(\)]{7,}\d)", blob)
         phones = [re.sub(r"[^\d+]", "", p) for p in phones]
         phones = [p for p in phones if len(re.sub(r"\D", "", p)) >= 7]
-        # unique preserve order
-        def uniq(seq):
-            seen = set()
-            out = []
-            for x in seq:
-                if x not in seen:
-                    seen.add(x)
-                    out.append(x)
-            return out
-        emails = uniq(emails)
-        phones = uniq(phones)
-        menu = tk.Menu(self, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"],
-                       activebackground=COLORS["accent"], font=("Segoe UI", 10))
-        shown = False
-        if emails:
-            for em in emails[:6]:
-                menu.add_command(
-                    label=f"Copy email address    {em}",
-                    command=lambda v=em: self._copy_plain(v, "Email copied"),
-                )
-                shown = True
-        if phones:
-            for ph in phones[:6]:
-                menu.add_command(
-                    label=f"Copy number    {ph}",
-                    command=lambda v=ph: self._copy_plain(v, "Number copied"),
-                )
-                shown = True
+        # unique
+        def uniq(xs):
+            o, s = [], set()
+            for x in xs:
+                k = x.lower() if isinstance(x, str) else x
+                if k not in s:
+                    s.add(k); o.append(x)
+            return o
+        emails, phones = uniq(emails), uniq(phones)
+
+        if getattr(self, "_ctx_pop", None):
+            try:
+                self._ctx_pop.destroy()
+            except Exception:
+                pass
+        pop = tk.Toplevel(self)
+        self._ctx_pop = pop
+        pop.overrideredirect(True)
+        pop.configure(bg="#111827")
+        pop.attributes("-topmost", True)
+        frm = tk.Frame(pop, bg="#1f2937", bd=1, highlightthickness=1, highlightbackground="#60a5fa")
+        frm.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        tk.Label(frm, text="Copy", bg="#1f2937", fg="#93c5fd",
+                 font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, padx=10, pady=(8, 2))
+
+        def add_btn(label, value):
+            tk.Button(
+                frm, text=label, command=lambda v=value: (self._copy_plain(v, "Copied"), pop.destroy()),
+                bg="#111827", fg="#f9fafb", relief=tk.FLAT, anchor=tk.W,
+                font=("Segoe UI", 10), padx=10, pady=6, cursor="hand2",
+                activebackground="#2563eb", activeforeground="white",
+            ).pack(fill=tk.X)
+
+        any_btn = False
+        for em in emails[:6]:
+            add_btn("Copy email address    " + em, em)
+            any_btn = True
+        for ph in phones[:6]:
+            add_btn("Copy number    " + ph, ph)
+            any_btn = True
         if extra:
-            if shown:
-                menu.add_separator()
-            menu.add_command(label="Copy selected text", command=self.copy_selection)
-            shown = True
-        if not shown:
-            menu.add_command(label="No email or number on this line", state=tk.DISABLED)
+            add_btn("Copy selected text", extra)
+            any_btn = True
+        elif hit:
+            add_btn("Copy this line", hit)
+            any_btn = True
+        if not any_btn:
+            tk.Label(frm, text="No email or number on this line",
+                     bg="#1f2937", fg="#9ca3af", font=("Segoe UI", 9),
+                     padx=10, pady=8).pack()
+        tk.Button(frm, text="Close", command=pop.destroy, bg="#374151", fg="white",
+                  relief=tk.FLAT, font=("Segoe UI", 9), pady=4, cursor="hand2").pack(fill=tk.X, padx=8, pady=8)
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            pop.geometry("+%d+%d" % (event.x_root + 4, event.y_root + 4))
         except Exception:
-            try:
-                menu.post(event.x_root, event.y_root)
-            except Exception:
-                pass
-        finally:
-            try:
-                menu.grab_release()
-            except Exception:
-                pass
+            pop.geometry("+200+200")
+        pop.focus_force()
+        pop.bind("<Escape>", lambda e: pop.destroy())
+        pop.bind("<FocusOut>", lambda e: pop.after(200, pop.destroy))
+        self.status.config(text="Copy menu opened")
+
+    def copy_contacts_on_page(self):
+        """Backup: list all emails/numbers on current page."""
+        if not self.pdf.doc:
+            messagebox.showinfo("No file", "Open a file first.", parent=self)
+            return
+        page = self.pdf.get_page(self.current_page)
+        text = ""
+        try:
+            text = page.get_text("text") or ""
+        except Exception:
+            text = self.selected_text or ""
+        emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)
+        phones = re.findall(r"(?:\+?\d[\d\-\s\(\)]{7,}\d)", text)
+        phones = [re.sub(r"[^\d+]", "", p) for p in phones]
+        phones = [p for p in phones if len(re.sub(r"\D", "", p)) >= 7]
+        if not emails and not phones:
+            messagebox.showinfo("None found", "No email or phone number on this page.", parent=self)
+            return
+        win = tk.Toplevel(self)
+        win.title("Emails & numbers on this page")
+        win.configure(bg=COLORS["surface"])
+        win.geometry("460x320")
+        win.transient(self)
+        lb = tk.Listbox(win, bg=COLORS["surface2"], fg=COLORS["text"], font=("Segoe UI", 11))
+        lb.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        items = [("email", e) for e in dict.fromkeys(emails)] + [("num", p) for p in dict.fromkeys(phones)]
+        for kind, val in items:
+            lb.insert(tk.END, ("Email: " if kind == "email" else "Number: ") + val)
+
+        def do_copy():
+            sel = lb.curselection()
+            if not sel:
+                return
+            val = items[int(sel[0])][1]
+            self._copy_plain(val, "Copied")
+
+        tk.Button(win, text="Copy selected", command=do_copy, bg=COLORS["accent"], fg="white",
+                  relief=tk.FLAT, padx=12, pady=6, cursor="hand2").pack(pady=(0, 12))
 
     def _copy_plain(self, text, msg="Copied"):
         try:
