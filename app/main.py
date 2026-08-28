@@ -1789,79 +1789,147 @@ class DocumentScannerWindow(tk.Toplevel):
 
 
     def auto_crop_document(self):
-        """Detect document edges and crop (OpenCV if available, else trim borders)."""
+        """Trim empty margins / find the page. Always tries a real crop."""
         base = self._base_rotated()
+        if base is None:
+            base = self.display_img
         if base is None:
             messagebox.showinfo("Auto crop", "Import or capture an image first.", parent=self)
             return
+        img = base.convert("RGB")
+        w, h = img.size
+        if w < 10 or h < 10:
+            return
+
+        def _edge_is_bg(im, side, bg, tol, strip):
+            px = im.load()
+            ww, hh = im.size
+            diffs = 0
+            total = 0
+            if side == "left":
+                for y in range(0, hh, 2):
+                    for x in range(strip):
+                        p = px[x, y]
+                        if abs(p[0]-bg[0]) + abs(p[1]-bg[1]) + abs(p[2]-bg[2]) > tol * 3:
+                            diffs += 1
+                        total += 1
+            elif side == "right":
+                for y in range(0, hh, 2):
+                    for x in range(ww - strip, ww):
+                        p = px[x, y]
+                        if abs(p[0]-bg[0]) + abs(p[1]-bg[1]) + abs(p[2]-bg[2]) > tol * 3:
+                            diffs += 1
+                        total += 1
+            elif side == "top":
+                for y in range(strip):
+                    for x in range(0, ww, 2):
+                        p = px[x, y]
+                        if abs(p[0]-bg[0]) + abs(p[1]-bg[1]) + abs(p[2]-bg[2]) > tol * 3:
+                            diffs += 1
+                        total += 1
+            else:
+                for y in range(hh - strip, hh):
+                    for x in range(0, ww, 2):
+                        p = px[x, y]
+                        if abs(p[0]-bg[0]) + abs(p[1]-bg[1]) + abs(p[2]-bg[2]) > tol * 3:
+                            diffs += 1
+                        total += 1
+            return (diffs / max(total, 1)) < 0.08
+
+        # background = average of four corners
+        px = img.load()
+        samples = [px[2, 2], px[w-3, 2], px[2, h-3], px[w-3, h-3],
+                   px[w//2, 2], px[w//2, h-3], px[2, h//2], px[w-3, h//2]]
+        bg = tuple(sum(c[i] for c in samples) // len(samples) for i in range(3))
+        tol = 22
+        strip = max(3, min(w, h) // 80)
+        x0, y0, x1, y1 = 0, 0, w, h
+        # shrink while edge looks like background
+        guard = 0
+        while x1 - x0 > w * 0.35 and guard < 400 and _edge_is_bg(img.crop((x0, y0, x1, y1)), "left", bg, tol, strip):
+            x0 += strip
+            guard += 1
+        guard = 0
+        while x1 - x0 > w * 0.35 and guard < 400 and _edge_is_bg(img.crop((x0, y0, x1, y1)), "right", bg, tol, strip):
+            x1 -= strip
+            guard += 1
+        guard = 0
+        while y1 - y0 > h * 0.35 and guard < 400 and _edge_is_bg(img.crop((x0, y0, x1, y1)), "top", bg, tol, strip):
+            y0 += strip
+            guard += 1
+        guard = 0
+        while y1 - y0 > h * 0.35 and guard < 400 and _edge_is_bg(img.crop((x0, y0, x1, y1)), "bottom", bg, tol, strip):
+            y1 -= strip
+            guard += 1
+
+        # also content mask (ink / contrast)
+        g = img.convert("L")
+        mask = g.point(lambda v: 255 if abs(v - (bg[0]+bg[1]+bg[2])//3) > 18 else 0)
+        bbox = mask.getbbox()
+        if bbox:
+            bx0, by0, bx1, by1 = bbox
+            pad = max(8, int(min(w, h) * 0.015))
+            bx0, by0 = max(0, bx0 - pad), max(0, by0 - pad)
+            bx1, by1 = min(w, bx1 + pad), min(h, by1 + pad)
+            # intersect with edge-trim (prefer tighter useful crop)
+            x0, y0 = max(x0, bx0), max(y0, by0)
+            x1, y1 = min(x1, bx1), min(y1, by1)
+
+        # OpenCV perspective if available and crop still huge
         try:
-            img = base.convert("RGB")
+            global HAS_CV2, cv2
+            if not HAS_CV2:
+                try:
+                    import cv2 as _cv2
+                    cv2 = _cv2
+                    HAS_CV2 = True
+                except Exception:
+                    pass
             if HAS_CV2:
                 import numpy as np
                 arr = np.array(img)
-                h, w = arr.shape[:2]
                 gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
                 gray = cv2.GaussianBlur(gray, (5, 5), 0)
-                edged = cv2.Canny(gray, 50, 150)
+                edged = cv2.Canny(gray, 40, 140)
                 edged = cv2.dilate(edged, None, iterations=2)
                 cnts, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
                 cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:8]
-                doc = None
                 for c in cnts:
+                    if cv2.contourArea(c) < w * h * 0.12:
+                        continue
                     peri = cv2.arcLength(c, True)
                     approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-                    if len(approx) == 4 and cv2.contourArea(approx) > (w * h * 0.12):
-                        doc = approx.reshape(4, 2)
-                        break
-                if doc is not None:
-                    # order points: tl, tr, br, bl
-                    pts = doc.astype("float32")
-                    s = pts.sum(axis=1)
-                    diff = np.diff(pts, axis=1)
-                    tl = pts[np.argmin(s)]
-                    br = pts[np.argmax(s)]
-                    tr = pts[np.argmin(diff)]
-                    bl = pts[np.argmax(diff)]
-                    rect = np.array([tl, tr, br, bl], dtype="float32")
-                    widthA = np.linalg.norm(br - bl)
-                    widthB = np.linalg.norm(tr - tl)
-                    maxW = max(int(widthA), int(widthB), 1)
-                    heightA = np.linalg.norm(tr - br)
-                    heightB = np.linalg.norm(tl - bl)
-                    maxH = max(int(heightA), int(heightB), 1)
-                    dst = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype="float32")
-                    M = cv2.getPerspectiveTransform(rect, dst)
-                    warped = cv2.warpPerspective(arr, M, (maxW, maxH))
-                    img = Image.fromarray(warped)
-                    self.source_img = img
-                    self.rotation = 0
-                    self._apply_filter_preview()
-                    self.status.config(text="Auto crop + perspective align applied")
-                    return
-            # Fallback: trim near-white / near-black borders
-            g = img.convert("L")
-            bw = g.point(lambda x: 0 if x > 245 else 255)
-            bbox = bw.getbbox()
-            if not bbox:
-                bw = g.point(lambda x: 0 if x < 15 else 255)
-                bbox = Image.eval(g, lambda x: 255 if 20 < x < 240 else 0).getbbox()
-            if bbox:
-                # pad slightly
-                x0, y0, x1, y1 = bbox
-                pad = 4
-                x0 = max(0, x0 - pad)
-                y0 = max(0, y0 - pad)
-                x1 = min(img.width, x1 + pad)
-                y1 = min(img.height, y1 + pad)
-                img = img.crop((x0, y0, x1, y1))
-                self.source_img = img
-                self.rotation = 0
-                self._apply_filter_preview()
-                self.status.config(text="Auto crop (border trim) applied")
-            else:
-                messagebox.showinfo("Auto crop", "Could not detect document edges.\nTry manual Crop mode.", parent=self)
-        except Exception as e:
-            messagebox.showerror("Auto crop failed", str(e), parent=self)
+                    if len(approx) == 4:
+                        pts = approx.reshape(4, 2).astype("float32")
+                        ssum, diff = pts.sum(1), np.diff(pts, axis=1)
+                        tl, br = pts[np.argmin(ssum)], pts[np.argmax(ssum)]
+                        tr, bl = pts[np.argmin(diff)], pts[np.argmax(diff)]
+                        rect = np.array([tl, tr, br, bl], dtype="float32")
+                        maxW = max(int(np.linalg.norm(br - bl)), int(np.linalg.norm(tr - tl)), 1)
+                        maxH = max(int(np.linalg.norm(tr - br)), int(np.linalg.norm(tl - bl)), 1)
+                        dst = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype="float32")
+                        M = cv2.getPerspectiveTransform(rect, dst)
+                        img = Image.fromarray(cv2.warpPerspective(arr, M, (maxW, maxH)))
+                        self.source_img = img
+                        self.rotation = 0
+                        self._apply_filter_preview()
+                        self.status.config(text="Auto crop applied (page detected)")
+                        return
+        except Exception:
+            pass
+
+        if x1 - x0 < 20 or y1 - y0 < 20:
+            messagebox.showinfo("Auto crop", "Could not crop. Use Crop mode and Apply crop.", parent=self)
+            return
+        if (x1 - x0) >= w * 0.98 and (y1 - y0) >= h * 0.98:
+            # still crop a small safe margin so user sees a change
+            m = max(4, int(min(w, h) * 0.02))
+            x0, y0, x1, y1 = m, m, w - m, h - m
+        cropped = img.crop((x0, y0, x1, y1))
+        self.source_img = cropped
+        self.rotation = 0
+        self._apply_filter_preview()
+        self.status.config(text="Auto crop applied")
 
     def auto_align_document(self):
         """Deskew / straighten document page."""
