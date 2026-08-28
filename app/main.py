@@ -3042,6 +3042,53 @@ class OnePDFEditor(tk.Tk):
         self._text_index_cache = {"key": key, "chars": chars}
         return chars
 
+
+    def _join_chars_with_gaps(self, chars):
+        """Join characters; insert space when columns are far apart."""
+        if not chars:
+            return ""
+        chars = sorted(chars, key=lambda x: x["bbox"].x0)
+        out = []
+        prev = None
+        for ch in chars:
+            if prev is not None:
+                gap = ch["bbox"].x0 - prev["bbox"].x1
+                pw = max(prev["bbox"].width, 2.5)
+                if gap > pw * 1.6:
+                    out.append(" ")
+            out.append(ch.get("c") or "")
+            prev = ch
+        return "".join(out)
+
+    def _extract_emails(self, text):
+        import re
+        text = text or ""
+        found = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)
+        cleaned = []
+        for em in found:
+            # glued zip + email: 94304tihipik603@...
+            m = re.match(r"^(\d{3,6})([A-Za-z].*@.+)$", em)
+            if m:
+                em = m.group(2)
+            if em not in cleaned:
+                cleaned.append(em)
+        return cleaned
+
+    def _extract_phones(self, text):
+        import re
+        text = text or ""
+        phones = re.findall(r"(?:\+?\d[\d\-\s\(\)]{7,}\d)", text)
+        out = []
+        for p in phones:
+            compact = re.sub(r"[^\d+]", "", p)
+            digits = re.sub(r"\D", "", compact)
+            # skip zip codes / short ids
+            if len(digits) < 8:
+                continue
+            if compact not in out:
+                out.append(compact)
+        return out
+
     def _collect_text_in_rect(self, page_idx, rect):
         r = fitz.Rect(rect)
         r.normalize()
@@ -3069,13 +3116,13 @@ class OnePDFEditor(tk.Tk):
             if cur_y is None:
                 cur_y = y
             if abs(y - cur_y) > 3 and buf:
-                lines.append("".join(buf))
-                buf = [ch["c"]]
+                lines.append(self._join_chars_with_gaps(buf))
+                buf = [ch]
                 cur_y = y
             else:
-                buf.append(ch["c"])
+                buf.append(ch)
         if buf:
-            lines.append("".join(buf))
+            lines.append(self._join_chars_with_gaps(buf))
         return "\n".join(lines).strip(), boxes
 
     def _line_text_at_point(self, page_idx, pt):
@@ -3103,8 +3150,7 @@ class OnePDFEditor(tk.Tk):
                 return ""
             hit_y = best["y"]
         line = [ch for ch in chars if abs(ch["y"] - hit_y) <= 3]
-        line.sort(key=lambda x: x["bbox"].x0)
-        return "".join(ch["c"] for ch in line)
+        return self._join_chars_with_gaps(line)
 
     def _draw_text_selection_overlay(self):
         """Update highlight only — do not re-render PDF pages."""
@@ -3179,10 +3225,8 @@ class OnePDFEditor(tk.Tk):
                 hit = ""
         extra = (getattr(self, "selected_text", None) or "").strip()
         blob = " ".join(x for x in (hit, extra) if x)
-        emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", blob)
-        phones = re.findall(r"(?:\+?\d[\d\-\s\(\)]{7,}\d)", blob)
-        phones = [re.sub(r"[^\d+]", "", p) for p in phones]
-        phones = [p for p in phones if len(re.sub(r"\D", "", p)) >= 7]
+        emails = self._extract_emails(blob)
+        phones = self._extract_phones(blob)
         # unique
         def uniq(xs):
             o, s = [], set()
@@ -3256,10 +3300,8 @@ class OnePDFEditor(tk.Tk):
             text = page.get_text("text") or ""
         except Exception:
             text = self.selected_text or ""
-        emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)
-        phones = re.findall(r"(?:\+?\d[\d\-\s\(\)]{7,}\d)", text)
-        phones = [re.sub(r"[^\d+]", "", p) for p in phones]
-        phones = [p for p in phones if len(re.sub(r"\D", "", p)) >= 7]
+        emails = self._extract_emails(text)
+        phones = self._extract_phones(text)
         if not emails and not phones:
             messagebox.showinfo("None found", "No email or phone number on this page.", parent=self)
             return
@@ -5051,72 +5093,123 @@ class OnePDFEditor(tk.Tk):
         except Exception as e:
             messagebox.showerror("Copy failed", str(e), parent=self)
 
+    def _list_windows_printers(self):
+        names = []
+        default = ""
+        try:
+            import win32print
+            flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+            for p in win32print.EnumPrinters(flags):
+                n = p[2]
+                if n and n not in names:
+                    names.append(n)
+            try:
+                default = win32print.GetDefaultPrinter() or ""
+            except Exception:
+                default = ""
+        except Exception:
+            pass
+        if not names:
+            try:
+                import subprocess
+                out = subprocess.check_output(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Printer | Select-Object -ExpandProperty Name"],
+                    text=True, stderr=subprocess.DEVNULL, timeout=8,
+                )
+                for line in out.splitlines():
+                    n = line.strip()
+                    if n and n not in names:
+                        names.append(n)
+            except Exception:
+                pass
+        return names, default
+
     def print_document(self):
-        """Open Windows print dialog for the current PDF."""
+        """Show an in-app print popup (no Chrome)."""
         if not self.pdf.doc:
             messagebox.showinfo("No file", "Open a file first.", parent=self)
             return
         try:
-            tmp = Path(tempfile.gettempdir()) / f"OnePDF_print_{os.getpid()}.pdf"
-            self.pdf.doc.save(str(tmp), garbage=1, deflate=True)
-            path = str(tmp)
-            if not sys.platform.startswith("win"):
-                try:
-                    import subprocess
-                    if sys.platform == "darwin":
-                        subprocess.Popen(["open", path])
-                        self.status.config(text="Opened in Preview — use File → Print (Cmd+P)")
-                    else:
-                        subprocess.Popen(["xdg-open", path])
-                        self.status.config(text="Opened PDF — print from viewer")
-                except Exception as e:
-                    messagebox.showinfo("Print", f"Saved print copy to:\n{path}\n\n{e}", parent=self)
-                return
-            opened = False
-            # 1) ShellExecute Print verb
+            tmp = Path(tempfile.gettempdir()) / ("OnePDF_print_%s.pdf" % os.getpid())
             try:
-                import ctypes
-                rc = ctypes.windll.shell32.ShellExecuteW(
-                    None, "print", path, None, None, 1
-                )
-                if rc > 32:
-                    opened = True
+                tmp.write_bytes(self.pdf.doc.tobytes(deflate=True))
             except Exception:
-                pass
-            # 2) PowerShell Start-Process -Verb Print
-            if not opened:
-                try:
-                    import subprocess
-                    subprocess.Popen(
-                        [
-                            "powershell",
-                            "-NoProfile",
-                            "-Command",
-                            f'Start-Process -FilePath "{path}" -Verb Print',
-                        ],
-                        shell=False,
-                    )
-                    opened = True
-                except Exception:
-                    pass
-            # 3) os.startfile print
-            if not opened:
-                try:
-                    os.startfile(path, "print")
-                    opened = True
-                except Exception:
-                    pass
-            # 4) open file so user can print from viewer
-            if not opened:
-                try:
-                    os.startfile(path)
-                    opened = True
-                except Exception as e:
-                    messagebox.showerror("Print failed", str(e), parent=self)
-                    return
-            self.status.config(text="Print dialog requested — choose printer in Windows")
+                self.pdf.doc.save(str(tmp), garbage=1, deflate=True)
+            path = os.path.normpath(str(tmp))
+            if not os.path.isfile(path):
+                raise RuntimeError("Could not create print file")
         except Exception as e:
             messagebox.showerror("Print failed", str(e), parent=self)
+            return
+
+        if not sys.platform.startswith("win"):
+            try:
+                import subprocess
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", path])
+                else:
+                    subprocess.Popen(["xdg-open", path])
+            except Exception as e:
+                messagebox.showerror("Print failed", str(e), parent=self)
+            return
+
+        printers, default = self._list_windows_printers()
+        win = tk.Toplevel(self)
+        win.title("Print")
+        win.configure(bg=COLORS["surface"])
+        win.geometry("420x220")
+        win.transient(self)
+        win.grab_set()
+        tk.Label(win, text="Print document", bg=COLORS["surface"], fg=COLORS["text"],
+                 font=("Segoe UI", 13, "bold")).pack(anchor=tk.W, padx=16, pady=(14, 6))
+        tk.Label(win, text="Printer", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Segoe UI", 9)).pack(anchor=tk.W, padx=16)
+        var = tk.StringVar(value=default if default in printers else (printers[0] if printers else ""))
+        cb = ttk.Combobox(win, textvariable=var, values=printers, state="readonly", font=("Segoe UI", 10))
+        cb.pack(fill=tk.X, padx=16, pady=6)
+        if not printers:
+            tk.Label(win, text="No printer found. Add a printer in Windows settings.",
+                     bg=COLORS["surface"], fg="#fbbf24", font=("Segoe UI", 9)).pack(anchor=tk.W, padx=16)
+
+        def do_print():
+            printer = (var.get() or "").strip()
+            try:
+                sent = False
+                if printer:
+                    try:
+                        import win32api
+                        win32api.ShellExecute(0, "printto", path, '"%s"' % printer, ".", 0)
+                        sent = True
+                    except Exception:
+                        pass
+                    if not sent:
+                        import subprocess
+                        qpath = path.replace("'", "''")
+                        qprn = printer.replace("'", "''")
+                        subprocess.Popen(
+                            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+                             "Start-Process -LiteralPath '%s' -Verb PrintTo -ArgumentList '%s'" % (qpath, qprn)],
+                        )
+                        sent = True
+                if not sent:
+                    import ctypes
+                    rc = ctypes.windll.shell32.ShellExecuteW(None, "print", path, None, None, 1)
+                    sent = rc > 32
+                if not sent:
+                    os.startfile(path, "print")
+                self.status.config(text="Sent to printer: " + (printer or "default"))
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Print failed", str(e), parent=win)
+
+        bf = tk.Frame(win, bg=COLORS["surface"])
+        bf.pack(fill=tk.X, padx=16, pady=16)
+        tk.Button(bf, text="Print", command=do_print, bg=COLORS["accent"], fg="white",
+                  relief=tk.FLAT, padx=18, pady=6, font=("Segoe UI", 10, "bold"),
+                  cursor="hand2").pack(side=tk.RIGHT)
+        tk.Button(bf, text="Cancel", command=win.destroy, bg=COLORS["surface2"], fg=COLORS["text"],
+                  relief=tk.FLAT, padx=14, pady=6, cursor="hand2").pack(side=tk.RIGHT, padx=8)
 
     def start_place_symbol(self, char):
         if not self.pdf.doc:
