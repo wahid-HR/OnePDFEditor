@@ -7,6 +7,7 @@ Offline PDF / Image / Document viewer & editor for Windows.
 """
 
 import os
+import re
 import queue
 import sys
 import io
@@ -30,6 +31,12 @@ try:
     HAS_DOCX = True
 except ImportError:
     HAS_DOCX = False
+
+try:
+    import cv2
+    HAS_CV2 = True
+except Exception:
+    HAS_CV2 = False
 
 def convert_docx_via_word(path):
     """Convert .docx to PDF using installed Microsoft Word (best fidelity).
@@ -3157,6 +3164,7 @@ class OnePDFEditor(tk.Tk):
         return "break"
 
     def _show_contact_popup(self, event):
+        import re
         try:
             cx = self.canvas.canvasx(self.canvas.winfo_pointerx() - self.canvas.winfo_rootx())
             cy = self.canvas.canvasy(self.canvas.winfo_pointery() - self.canvas.winfo_rooty())
@@ -3237,6 +3245,7 @@ class OnePDFEditor(tk.Tk):
         self.status.config(text="Copy menu opened")
 
     def copy_contacts_on_page(self):
+        import re
         """Backup: list all emails/numbers on current page."""
         if not self.pdf.doc:
             messagebox.showinfo("No file", "Open a file first.", parent=self)
