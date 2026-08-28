@@ -1591,52 +1591,82 @@ class DocumentScannerWindow(tk.Toplevel):
         self.status.config(text=f"{len(self.pages)} page(s) in scan")
 
     def capture_camera(self):
+        """Open live webcam preview and capture a page."""
         if not HAS_CV2:
             messagebox.showinfo(
                 "Camera",
-                "OpenCV not available in this build.\n\nUse Import image instead\n(or install opencv-python and rebuild).",
+                "Camera library is not in this build.\nRebuild with opencv-python, or use Import image.",
+                parent=self,
+            )
+            return
+        cap = None
+        last = ""
+        for idx in (0, 1, 2):
+            for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, 0):
+                try:
+                    c = cv2.VideoCapture(idx, backend) if backend else cv2.VideoCapture(idx)
+                    if c is not None and c.isOpened():
+                        ok, fr = c.read()
+                        if ok and fr is not None:
+                            cap = c
+                            break
+                        c.release()
+                    elif c is not None:
+                        c.release()
+                except Exception as e:
+                    last = str(e)
+            if cap is not None:
+                break
+        if cap is None:
+            messagebox.showerror(
+                "Camera",
+                "Could not open webcam.\n\nCheck that a camera is connected and not used by another app.\n\n%s" % last,
                 parent=self,
             )
             return
         try:
-            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                messagebox.showerror("Camera", "Could not open webcam.", parent=self)
-                return
             win = tk.Toplevel(self)
-            win.title("Camera — click Capture")
+            win.title("Camera")
             win.configure(bg=COLORS["surface"])
+            win.geometry("720x560")
+            win.transient(self)
             lbl = tk.Label(win, bg="#000")
-            lbl.pack(padx=8, pady=8)
+            lbl.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
             state = {"photo": None, "frame": None, "running": True}
 
             def update():
                 if not state["running"]:
                     return
-                ok, frame = cap.read()
-                if ok:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    state["frame"] = frame
-                    im = Image.fromarray(frame)
-                    im.thumbnail((640, 480), Image.Resampling.LANCZOS)
-                    state["photo"] = ImageTk.PhotoImage(im)
-                    lbl.config(image=state["photo"])
-                win.after(30, update)
+                try:
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        state["frame"] = frame
+                        im = Image.fromarray(frame)
+                        im.thumbnail((680, 460), Image.Resampling.LANCZOS)
+                        state["photo"] = ImageTk.PhotoImage(im)
+                        lbl.config(image=state["photo"])
+                except Exception:
+                    pass
+                if state["running"]:
+                    win.after(33, update)
 
             def do_capture():
                 if state["frame"] is None:
+                    messagebox.showinfo("Camera", "Wait for the live picture, then Capture.", parent=win)
                     return
                 img = Image.fromarray(state["frame"]).convert("RGB")
                 state["running"] = False
-                cap.release()
+                try:
+                    cap.release()
+                except Exception:
+                    pass
                 win.destroy()
                 self.source_img = img
                 self.rotation = 0
                 self.filter_var.set("Enhance")
                 self._apply_filter_preview()
-                self.status.config(text="Captured — adjust filter/crop, then Add page")
+                self.status.config(text="Captured — filter/crop, then Add page")
 
             def on_close():
                 state["running"] = False
@@ -1649,12 +1679,17 @@ class DocumentScannerWindow(tk.Toplevel):
             bf = tk.Frame(win, bg=COLORS["surface"])
             bf.pack(fill=tk.X, padx=8, pady=8)
             tk.Button(bf, text="Capture", command=do_capture, bg=COLORS["accent"], fg="white",
-                      relief=tk.FLAT, padx=14, pady=6, cursor="hand2").pack(side=tk.LEFT)
+                      relief=tk.FLAT, padx=16, pady=8, font=("Segoe UI", 10, "bold"),
+                      cursor="hand2").pack(side=tk.LEFT)
             tk.Button(bf, text="Cancel", command=on_close, bg=COLORS["surface2"], fg=COLORS["text"],
-                      relief=tk.FLAT, padx=12, pady=6, cursor="hand2").pack(side=tk.RIGHT)
+                      relief=tk.FLAT, padx=12, pady=8, cursor="hand2").pack(side=tk.RIGHT)
             win.protocol("WM_DELETE_WINDOW", on_close)
             update()
         except Exception as e:
+            try:
+                cap.release()
+            except Exception:
+                pass
             messagebox.showerror("Camera failed", str(e), parent=self)
 
     def _enhance(self, img, mode):
@@ -5126,7 +5161,7 @@ class OnePDFEditor(tk.Tk):
         return names, default
 
     def print_document(self):
-        """Show an in-app print popup (no Chrome)."""
+        """Print popup with page preview (Chrome-style layout, no browser)."""
         if not self.pdf.doc:
             messagebox.showinfo("No file", "Open a file first.", parent=self)
             return
@@ -5137,8 +5172,6 @@ class OnePDFEditor(tk.Tk):
             except Exception:
                 self.pdf.doc.save(str(tmp), garbage=1, deflate=True)
             path = os.path.normpath(str(tmp))
-            if not os.path.isfile(path):
-                raise RuntimeError("Could not create print file")
         except Exception as e:
             messagebox.showerror("Print failed", str(e), parent=self)
             return
@@ -5146,70 +5179,109 @@ class OnePDFEditor(tk.Tk):
         if not sys.platform.startswith("win"):
             try:
                 import subprocess
-                if sys.platform == "darwin":
-                    subprocess.Popen(["open", path])
-                else:
-                    subprocess.Popen(["xdg-open", path])
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
             except Exception as e:
                 messagebox.showerror("Print failed", str(e), parent=self)
             return
 
+        n = self.pdf.page_count()
         printers, default = self._list_windows_printers()
         win = tk.Toplevel(self)
         win.title("Print")
-        win.configure(bg=COLORS["surface"])
-        win.geometry("420x220")
+        win.configure(bg="#e8e8e8")
+        win.geometry("920x620")
+        win.minsize(800, 520)
         win.transient(self)
-        win.grab_set()
-        tk.Label(win, text="Print document", bg=COLORS["surface"], fg=COLORS["text"],
-                 font=("Segoe UI", 13, "bold")).pack(anchor=tk.W, padx=16, pady=(14, 6))
-        tk.Label(win, text="Printer", bg=COLORS["surface"], fg=COLORS["text_dim"],
-                 font=("Segoe UI", 9)).pack(anchor=tk.W, padx=16)
-        var = tk.StringVar(value=default if default in printers else (printers[0] if printers else ""))
-        cb = ttk.Combobox(win, textvariable=var, values=printers, state="readonly", font=("Segoe UI", 10))
-        cb.pack(fill=tk.X, padx=16, pady=6)
-        if not printers:
-            tk.Label(win, text="No printer found. Add a printer in Windows settings.",
-                     bg=COLORS["surface"], fg="#fbbf24", font=("Segoe UI", 9)).pack(anchor=tk.W, padx=16)
+
+        body = tk.Frame(win, bg="#e8e8e8")
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        left = tk.Frame(body, bg="#d6d6d6", width=480)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        left.pack_propagate(False)
+        preview_lbl = tk.Label(left, bg="#d6d6d6")
+        preview_lbl.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        thumbs = {"img": None}
+
+        def show_preview(page_i=0):
+            try:
+                page = self.pdf.get_page(max(0, min(page_i, n - 1)))
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                im.thumbnail((420, 540), Image.Resampling.LANCZOS)
+                thumbs["img"] = ImageTk.PhotoImage(im)
+                preview_lbl.config(image=thumbs["img"], text="")
+            except Exception as e:
+                preview_lbl.config(text="Preview failed\n" + str(e), image="")
+
+        show_preview(self.current_page if 0 <= self.current_page < n else 0)
+
+        right = tk.Frame(body, bg="#f3f3f3", width=360)
+        right.pack(side=tk.RIGHT, fill=tk.Y)
+        right.pack_propagate(False)
+        tk.Label(right, text="Print", bg="#f3f3f3", fg="#111",
+                 font=("Segoe UI", 16)).pack(anchor=tk.W, padx=18, pady=(16, 4))
+        tk.Label(right, text="%d sheet(s)" % n, bg="#f3f3f3", fg="#555",
+                 font=("Segoe UI", 9)).pack(anchor=tk.E, padx=18)
+
+        def field(label, widget):
+            tk.Label(right, text=label, bg="#f3f3f3", fg="#333",
+                     font=("Segoe UI", 9)).pack(anchor=tk.W, padx=18, pady=(10, 2))
+            widget.pack(fill=tk.X, padx=18)
+
+        var_prn = tk.StringVar(value=default if default in printers else (printers[0] if printers else ""))
+        cb = ttk.Combobox(right, textvariable=var_prn, values=printers, state="readonly")
+        field("Destination", cb)
+
+        var_pages = tk.StringVar(value="All")
+        cb2 = ttk.Combobox(right, textvariable=var_pages, values=("All", "Current page"), state="readonly")
+        field("Pages", cb2)
+
+        var_color = tk.StringVar(value="Color")
+        cb3 = ttk.Combobox(right, textvariable=var_color, values=("Color", "Black and white"), state="readonly")
+        field("Color", cb3)
+
+        var_paper = tk.StringVar(value="Letter")
+        cb4 = ttk.Combobox(right, textvariable=var_paper, values=("Letter", "A4", "Legal"), state="readonly")
+        field("Paper size", cb4)
 
         def do_print():
-            printer = (var.get() or "").strip()
+            printer = (var_prn.get() or "").strip()
             try:
+                use_path = path
+                if var_pages.get() == "Current page":
+                    one = fitz.open()
+                    one.insert_pdf(self.pdf.doc, from_page=self.current_page, to_page=self.current_page)
+                    one_path = Path(tempfile.gettempdir()) / ("OnePDF_print_one_%s.pdf" % os.getpid())
+                    one.save(str(one_path))
+                    one.close()
+                    use_path = os.path.normpath(str(one_path))
                 sent = False
                 if printer:
                     try:
                         import win32api
-                        win32api.ShellExecute(0, "printto", path, '"%s"' % printer, ".", 0)
+                        win32api.ShellExecute(0, "printto", use_path, '"%s"' % printer, ".", 0)
                         sent = True
                     except Exception:
                         pass
-                    if not sent:
-                        import subprocess
-                        qpath = path.replace("'", "''")
-                        qprn = printer.replace("'", "''")
-                        subprocess.Popen(
-                            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
-                             "Start-Process -LiteralPath '%s' -Verb PrintTo -ArgumentList '%s'" % (qpath, qprn)],
-                        )
-                        sent = True
                 if not sent:
                     import ctypes
-                    rc = ctypes.windll.shell32.ShellExecuteW(None, "print", path, None, None, 1)
+                    rc = ctypes.windll.shell32.ShellExecuteW(None, "print", use_path, None, None, 1)
                     sent = rc > 32
                 if not sent:
-                    os.startfile(path, "print")
+                    os.startfile(use_path, "print")
                 self.status.config(text="Sent to printer: " + (printer or "default"))
                 win.destroy()
             except Exception as e:
                 messagebox.showerror("Print failed", str(e), parent=win)
 
-        bf = tk.Frame(win, bg=COLORS["surface"])
-        bf.pack(fill=tk.X, padx=16, pady=16)
-        tk.Button(bf, text="Print", command=do_print, bg=COLORS["accent"], fg="white",
-                  relief=tk.FLAT, padx=18, pady=6, font=("Segoe UI", 10, "bold"),
-                  cursor="hand2").pack(side=tk.RIGHT)
-        tk.Button(bf, text="Cancel", command=win.destroy, bg=COLORS["surface2"], fg=COLORS["text"],
-                  relief=tk.FLAT, padx=14, pady=6, cursor="hand2").pack(side=tk.RIGHT, padx=8)
+        bf = tk.Frame(right, bg="#f3f3f3")
+        bf.pack(side=tk.BOTTOM, fill=tk.X, padx=18, pady=18)
+        tk.Button(bf, text="Cancel", command=win.destroy, bg="#e5e5e5", fg="#111",
+                  relief=tk.FLAT, padx=16, pady=8, cursor="hand2").pack(side=tk.RIGHT)
+        tk.Button(bf, text="Print", command=do_print, bg="#1a73e8", fg="white",
+                  relief=tk.FLAT, padx=22, pady=8, font=("Segoe UI", 10, "bold"),
+                  cursor="hand2").pack(side=tk.RIGHT, padx=8)
 
     def start_place_symbol(self, char):
         if not self.pdf.doc:
