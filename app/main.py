@@ -1592,6 +1592,14 @@ class DocumentScannerWindow(tk.Toplevel):
 
     def capture_camera(self):
         """Open live webcam preview and capture a page."""
+        global HAS_CV2, cv2
+        if not HAS_CV2:
+            try:
+                import cv2 as _cv2
+                cv2 = _cv2
+                HAS_CV2 = True
+            except Exception:
+                pass
         if not HAS_CV2:
             messagebox.showinfo(
                 "Camera",
@@ -5196,25 +5204,29 @@ class OnePDFEditor(tk.Tk):
         body = tk.Frame(win, bg="#e8e8e8")
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
-        left = tk.Frame(body, bg="#d6d6d6", width=480)
+        left = tk.Frame(body, bg="#cfcfcf", width=500)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        left.pack_propagate(False)
-        preview_lbl = tk.Label(left, bg="#d6d6d6")
-        preview_lbl.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
-        thumbs = {"img": None}
+        preview_cv = tk.Canvas(left, bg="#cfcfcf", highlightthickness=0)
+        preview_cv.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
         def show_preview(page_i=0):
             try:
-                page = self.pdf.get_page(max(0, min(page_i, n - 1)))
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                idx = max(0, min(int(page_i), max(n - 1, 0)))
+                page = self.pdf.doc[idx]
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
                 im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                im.thumbnail((420, 540), Image.Resampling.LANCZOS)
-                thumbs["img"] = ImageTk.PhotoImage(im)
-                preview_lbl.config(image=thumbs["img"], text="")
+                cw = max(preview_cv.winfo_width(), 360)
+                ch = max(preview_cv.winfo_height(), 420)
+                im.thumbnail((max(cw - 20, 200), max(ch - 20, 260)), Image.Resampling.LANCZOS)
+                win._preview_img = ImageTk.PhotoImage(im)
+                preview_cv.delete("all")
+                preview_cv.create_image(cw // 2, ch // 2, image=win._preview_img, anchor=tk.CENTER)
             except Exception as e:
-                preview_lbl.config(text="Preview failed\n" + str(e), image="")
+                preview_cv.delete("all")
+                preview_cv.create_text(20, 20, anchor=tk.NW, text="Preview failed\n" + str(e), fill="#333")
 
-        show_preview(self.current_page if 0 <= self.current_page < n else 0)
+        win.after(80, lambda: show_preview(self.current_page if 0 <= self.current_page < n else 0))
+        preview_cv.bind("<Configure>", lambda e: show_preview(self.current_page if 0 <= self.current_page < n else 0))
 
         right = tk.Frame(body, bg="#f3f3f3", width=360)
         right.pack(side=tk.RIGHT, fill=tk.Y)
