@@ -2260,6 +2260,7 @@ class OnePDFEditor(tk.Tk):
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
         self.canvas.bind("<Button-3>", self._on_canvas_right_click)
+        self.canvas.bind("<ButtonRelease-3>", self._on_canvas_right_click)
         self.canvas.bind("<Control-Button-1>", self._on_canvas_right_click)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
@@ -2989,49 +2990,107 @@ class OnePDFEditor(tk.Tk):
         self._sel_end = None
 
     def _text_index(self, page_idx):
-        """Cached line-level text boxes for fast selection (no rawdict every mouse move)."""
-        key = (page_idx, int(self.zoom * 100))
+        """Cached characters for precise, fast selection."""
+        key = (id(self.pdf.doc) if self.pdf.doc else 0, page_idx)
         cache = getattr(self, "_text_index_cache", None)
         if cache and cache.get("key") == key:
-            return cache["lines"]
+            return cache["chars"]
+        chars = []
         page = self.pdf.get_page(page_idx)
-        lines = []
         if page:
             try:
-                data = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
+                data = page.get_text("rawdict", flags=fitz.TEXTFLAGS_TEXT)
                 for block in data.get("blocks", []):
                     if block.get("type", 0) != 0:
                         continue
                     for line in block.get("lines", []):
-                        parts = []
-                        bbox = None
+                        ly = line.get("bbox", [0, 0, 0, 0])[1]
                         for span in line.get("spans", []):
-                            t = span.get("text") or ""
-                            if t:
-                                parts.append(t)
-                            sb = fitz.Rect(span.get("bbox"))
-                            bbox = sb if bbox is None else (bbox | sb)
-                        text = "".join(parts)
-                        if text.strip() and bbox is not None:
-                            lines.append({"text": text, "bbox": fitz.Rect(bbox)})
+                            chs = span.get("chars") or []
+                            if chs:
+                                for ch in chs:
+                                    c = ch.get("c") or ""
+                                    bb = fitz.Rect(ch.get("bbox"))
+                                    if c:
+                                        chars.append({"c": c, "bbox": bb, "y": ly})
+                            else:
+                                t = span.get("text") or ""
+                                sb = fitz.Rect(span.get("bbox"))
+                                if t:
+                                    # approximate per-char boxes
+                                    n = max(len(t), 1)
+                                    w = sb.width / n
+                                    for k, c in enumerate(t):
+                                        cb = fitz.Rect(sb.x0 + k * w, sb.y0, sb.x0 + (k + 1) * w, sb.y1)
+                                        chars.append({"c": c, "bbox": cb, "y": sb.y0})
             except Exception:
                 pass
-        self._text_index_cache = {"key": key, "lines": lines}
-        return lines
+        self._text_index_cache = {"key": key, "chars": chars}
+        return chars
 
     def _collect_text_in_rect(self, page_idx, rect):
         r = fitz.Rect(rect)
         r.normalize()
-        if r.is_empty or r.width < 1 or r.height < 1:
+        if r.is_empty or r.width < 0.5 or r.height < 0.5:
             return "", []
-        chars_out = []
+        # thin click-like rect: expand a bit vertically so one line hits
+        if r.height < 4:
+            r = fitz.Rect(r.x0, r.y0 - 2, r.x1, r.y1 + 2)
+        picked = []
         boxes = []
-        for line in self._text_index(page_idx):
-            bb = line["bbox"]
+        for ch in self._text_index(page_idx):
+            bb = ch["bbox"]
             if bb.intersects(r):
-                chars_out.append(line["text"])
+                picked.append(ch)
                 boxes.append(bb)
-        return "\n".join(chars_out).strip(), boxes
+        if not picked:
+            return "", []
+        # keep visual order
+        picked.sort(key=lambda x: (round(x["y"], 1), x["bbox"].x0))
+        lines = []
+        cur_y = None
+        buf = []
+        for ch in picked:
+            y = round(ch["y"], 1)
+            if cur_y is None:
+                cur_y = y
+            if abs(y - cur_y) > 3 and buf:
+                lines.append("".join(buf))
+                buf = [ch["c"]]
+                cur_y = y
+            else:
+                buf.append(ch["c"])
+        if buf:
+            lines.append("".join(buf))
+        return "\n".join(lines).strip(), boxes
+
+    def _line_text_at_point(self, page_idx, pt):
+        """Full line under cursor — for email/phone right-click."""
+        chars = self._text_index(page_idx)
+        if not chars:
+            return ""
+        hit_y = None
+        for ch in chars:
+            if ch["bbox"].contains(pt) or ch["bbox"].intersects(
+                fitz.Rect(pt.x - 2, pt.y - 2, pt.x + 2, pt.y + 2)
+            ):
+                hit_y = ch["y"]
+                break
+        if hit_y is None:
+            # nearest line by y
+            best = None
+            best_d = 1e9
+            for ch in chars:
+                d = abs((ch["bbox"].y0 + ch["bbox"].y1) / 2 - pt.y)
+                if d < best_d:
+                    best_d = d
+                    best = ch
+            if best is None or best_d > 18:
+                return ""
+            hit_y = best["y"]
+        line = [ch for ch in chars if abs(ch["y"] - hit_y) <= 3]
+        line.sort(key=lambda x: x["bbox"].x0)
+        return "".join(ch["c"] for ch in line)
 
     def _draw_text_selection_overlay(self):
         """Update highlight only — do not re-render PDF pages."""
@@ -3067,38 +3126,64 @@ class OnePDFEditor(tk.Tk):
             pt = self._canvas_to_pdf(cx, cy)
         except Exception:
             return
-        # gather nearby text
         hit = ""
         try:
-            r = fitz.Rect(pt.x - 8, pt.y - 10, pt.x + 220, pt.y + 10)
-            hit, _ = self._collect_text_in_rect(self.current_page, r)
+            hit = self._line_text_at_point(self.current_page, pt)
         except Exception:
             hit = ""
-        if not hit and self.selected_text:
-            hit = self.selected_text
-        emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", hit or "")
-        phones = re.findall(r"(?:\+?\d[\d\-\s\(\)]{7,}\d)", hit or "")
+        extra = (getattr(self, "selected_text", None) or "").strip()
+        blob = " ".join(x for x in (hit, extra) if x)
+        emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", blob)
+        phones = re.findall(r"(?:\+?\d[\d\-\s\(\)]{7,}\d)", blob)
         phones = [re.sub(r"[^\d+]", "", p) for p in phones]
         phones = [p for p in phones if len(re.sub(r"\D", "", p)) >= 7]
+        # unique preserve order
+        def uniq(seq):
+            seen = set()
+            out = []
+            for x in seq:
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return out
+        emails = uniq(emails)
+        phones = uniq(phones)
         menu = tk.Menu(self, tearoff=0, bg=COLORS["surface"], fg=COLORS["text"],
                        activebackground=COLORS["accent"], font=("Segoe UI", 10))
+        shown = False
         if emails:
-            for em in emails[:5]:
-                menu.add_command(label=f"Copy email address  ({em})",
-                                 command=lambda v=em: self._copy_plain(v, "Email copied"))
+            for em in emails[:6]:
+                menu.add_command(
+                    label=f"Copy email address    {em}",
+                    command=lambda v=em: self._copy_plain(v, "Email copied"),
+                )
+                shown = True
         if phones:
-            for ph in phones[:5]:
-                menu.add_command(label=f"Copy number  ({ph})",
-                                 command=lambda v=ph: self._copy_plain(v, "Number copied"))
-        if self.selected_text:
-            menu.add_separator()
+            for ph in phones[:6]:
+                menu.add_command(
+                    label=f"Copy number    {ph}",
+                    command=lambda v=ph: self._copy_plain(v, "Number copied"),
+                )
+                shown = True
+        if extra:
+            if shown:
+                menu.add_separator()
             menu.add_command(label="Copy selected text", command=self.copy_selection)
-        if not emails and not phones and not self.selected_text:
-            menu.add_command(label="No email or number here", state=tk.DISABLED)
+            shown = True
+        if not shown:
+            menu.add_command(label="No email or number on this line", state=tk.DISABLED)
         try:
             menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            try:
+                menu.post(event.x_root, event.y_root)
+            except Exception:
+                pass
         finally:
-            menu.grab_release()
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
 
     def _copy_plain(self, text, msg="Copied"):
         try:
