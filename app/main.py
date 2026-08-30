@@ -1556,15 +1556,13 @@ class DocumentScannerWindow(tk.Toplevel):
         self.canvas.bind("<Configure>", lambda e: self._redraw())
 
         # Right scrollable tools
-        right_wrap = tk.Frame(body, bg=COLORS["surface"], width=220)
+        right_wrap = tk.Frame(body, bg=COLORS["surface"], width=248)
         right_wrap.pack(side=tk.RIGHT, fill=tk.Y)
         right_wrap.pack_propagate(False)
-        right_cv = tk.Canvas(right_wrap, bg=COLORS["surface"], highlightthickness=0, width=200)
+        right_cv = tk.Canvas(right_wrap, bg=COLORS["surface"], highlightthickness=0, width=228)
         right_sy = tk.Scrollbar(right_wrap, orient=tk.VERTICAL, command=right_cv.yview)
-        right_sx = tk.Scrollbar(right_wrap, orient=tk.HORIZONTAL, command=right_cv.xview)
-        right_cv.configure(yscrollcommand=right_sy.set, xscrollcommand=right_sx.set)
+        right_cv.configure(yscrollcommand=right_sy.set)
         right_sy.pack(side=tk.RIGHT, fill=tk.Y)
-        right_sx.pack(side=tk.BOTTOM, fill=tk.X)
         right_cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         right = tk.Frame(right_cv, bg=COLORS["surface"])
         right_id = right_cv.create_window((0, 0), window=right, anchor=tk.NW)
@@ -1572,7 +1570,7 @@ class DocumentScannerWindow(tk.Toplevel):
         def _right_cfg(e=None):
             right_cv.configure(scrollregion=right_cv.bbox("all") or (0, 0, 200, 400))
             try:
-                right_cv.itemconfigure(right_id, width=max(right_cv.winfo_width(), 180))
+                right_cv.itemconfigure(right_id, width=max(right_cv.winfo_width(), 210))
             except Exception:
                 pass
         right.bind("<Configure>", _right_cfg)
@@ -1593,13 +1591,13 @@ class DocumentScannerWindow(tk.Toplevel):
         ]:
             tk.Button(
                 right, text=text, command=cmd, bg=COLORS["surface2"], fg=COLORS["text"],
-                relief=tk.FLAT, padx=10, pady=6, font=("Segoe UI", 9), cursor="hand2",
-                anchor=tk.W,
-            ).pack(fill=tk.X, pady=3)
-        tk.Label(right, text="Filter (apply on image)", bg=COLORS["surface"], fg=COLORS["text_dim"],
-                 font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(12, 2))
-        tk.Label(right, text="B&W / B&W Strong = black & white", bg=COLORS["surface"],
-                 fg=COLORS["text_dim"], font=("Segoe UI", 8)).pack(anchor=tk.W)
+                relief=tk.FLAT, padx=8, pady=6, font=("Segoe UI", 9), cursor="hand2",
+                anchor=tk.W, wraplength=190, justify=tk.LEFT,
+            ).pack(fill=tk.X, pady=3, padx=2)
+        tk.Label(right, text="Filter", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Segoe UI", 9, "bold"), wraplength=200, justify=tk.LEFT).pack(anchor=tk.W, pady=(12, 2), padx=2)
+        tk.Label(right, text="B&W = black and white", bg=COLORS["surface"],
+                 fg=COLORS["text_dim"], font=("Segoe UI", 8), wraplength=200, justify=tk.LEFT).pack(anchor=tk.W, padx=2)
         self.filter_var = tk.StringVar(value="Enhance")
         for name in self.FILTERS:
             tk.Radiobutton(
