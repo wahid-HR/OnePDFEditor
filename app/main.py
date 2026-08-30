@@ -1459,8 +1459,8 @@ class DocumentScannerWindow(tk.Toplevel):
         self.parent_app = parent
         self.title("Document Scanner — One PDF Editor")
         self.configure(bg=COLORS["surface"])
-        self.geometry("920x620")
-        self.minsize(780, 520)
+        self.geometry("980x640")
+        self.minsize(800, 500)
         self.transient(parent)
         self.pages = []  # list of PIL Image (RGB)
         self.current = -1
@@ -1474,6 +1474,29 @@ class DocumentScannerWindow(tk.Toplevel):
         self.rotation = 0
         self._build()
 
+    def _bind_mousewheel(self, widget, canvas, also_x=True):
+        def _on_wheel(e):
+            if getattr(e, "state", 0) & 0x0001:  # Shift = horizontal
+                canvas.xview_scroll(int(-1 * (e.delta / 120)), "units")
+            else:
+                canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            return "break"
+        def _on_shift_wheel(e):
+            canvas.xview_scroll(int(-1 * (e.delta / 120)), "units")
+            return "break"
+        def bind_tree(w):
+            w.bind("<MouseWheel>", _on_wheel)
+            w.bind("<Shift-MouseWheel>", _on_shift_wheel)
+            w.bind("<Button-4>", lambda e: (canvas.yview_scroll(-1, "units"), "break"))
+            w.bind("<Button-5>", lambda e: (canvas.yview_scroll(1, "units"), "break"))
+            for ch in w.winfo_children():
+                bind_tree(ch)
+        widget.bind("<Enter>", lambda e: bind_tree(widget))
+        canvas.bind("<MouseWheel>", _on_wheel)
+        canvas.bind("<Shift-MouseWheel>", _on_shift_wheel)
+        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
     def _build(self):
         top = tk.Frame(self, bg=COLORS["surface"])
         top.pack(fill=tk.X, padx=12, pady=10)
@@ -1485,25 +1508,44 @@ class DocumentScannerWindow(tk.Toplevel):
         body = tk.Frame(self, bg=COLORS["surface"])
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
 
-        # Left: page list
-        left = tk.Frame(body, bg=COLORS["surface"], width=180)
-        left.pack(side=tk.LEFT, fill=tk.Y)
-        left.pack_propagate(False)
-        tk.Label(left, text="Pages", bg=COLORS["surface"], fg=COLORS["text_dim"],
+        # Left scrollable pages
+        left_wrap = tk.Frame(body, bg=COLORS["surface"], width=190)
+        left_wrap.pack(side=tk.LEFT, fill=tk.Y)
+        left_wrap.pack_propagate(False)
+        tk.Label(left_wrap, text="Pages", bg=COLORS["surface"], fg=COLORS["text_dim"],
                  font=("Segoe UI", 9)).pack(anchor=tk.W)
+        left_cv = tk.Canvas(left_wrap, bg=COLORS["surface"], highlightthickness=0, width=174)
+        left_sy = tk.Scrollbar(left_wrap, orient=tk.VERTICAL, command=left_cv.yview)
+        left_sx = tk.Scrollbar(left_wrap, orient=tk.HORIZONTAL, command=left_cv.xview)
+        left_cv.configure(yscrollcommand=left_sy.set, xscrollcommand=left_sx.set)
+        left_sy.pack(side=tk.RIGHT, fill=tk.Y)
+        left_sx.pack(side=tk.BOTTOM, fill=tk.X)
+        left_cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        left = tk.Frame(left_cv, bg=COLORS["surface"])
+        left_id = left_cv.create_window((0, 0), window=left, anchor=tk.NW)
+        def _left_cfg(e=None):
+            left_cv.configure(scrollregion=left_cv.bbox("all") or (0, 0, 174, 200))
+            try:
+                left_cv.itemconfigure(left_id, width=max(left_cv.winfo_width(), 160))
+            except Exception:
+                pass
+        left.bind("<Configure>", _left_cfg)
+        left_cv.bind("<Configure>", _left_cfg)
         self.listbox = tk.Listbox(
             left, bg=COLORS["surface2"], fg=COLORS["text"], selectbackground=COLORS["accent"],
             font=("Segoe UI", 10), relief=tk.FLAT, activestyle="none", highlightthickness=0,
+            height=16, width=18,
         )
         self.listbox.pack(fill=tk.BOTH, expand=True, pady=4)
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
         lf_btns = tk.Frame(left, bg=COLORS["surface"])
         lf_btns.pack(fill=tk.X)
-        for t, c in [("↑", self.move_up), ("↓", self.move_down), ("✕", self.remove_page)]:
-            tk.Button(lf_btns, text=t, command=c, bg=COLORS["surface2"], fg=COLORS["text"],
+        for t, cmd in [("↑", self.move_up), ("↓", self.move_down), ("✕", self.remove_page)]:
+            tk.Button(lf_btns, text=t, command=cmd, bg=COLORS["surface2"], fg=COLORS["text"],
                       relief=tk.FLAT, padx=8, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=2)
+        self._bind_mousewheel(left, left_cv)
 
-        # Center: canvas preview
+        # Center preview
         mid = tk.Frame(body, bg=COLORS["surface"])
         mid.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
         self.canvas = tk.Canvas(mid, bg="#0b1220", highlightthickness=0, cursor="crosshair")
@@ -1513,10 +1555,29 @@ class DocumentScannerWindow(tk.Toplevel):
         self.canvas.bind("<ButtonRelease-1>", self._on_up)
         self.canvas.bind("<Configure>", lambda e: self._redraw())
 
-        # Right: tools
-        right = tk.Frame(body, bg=COLORS["surface"], width=200)
-        right.pack(side=tk.RIGHT, fill=tk.Y)
-        right.pack_propagate(False)
+        # Right scrollable tools
+        right_wrap = tk.Frame(body, bg=COLORS["surface"], width=220)
+        right_wrap.pack(side=tk.RIGHT, fill=tk.Y)
+        right_wrap.pack_propagate(False)
+        right_cv = tk.Canvas(right_wrap, bg=COLORS["surface"], highlightthickness=0, width=200)
+        right_sy = tk.Scrollbar(right_wrap, orient=tk.VERTICAL, command=right_cv.yview)
+        right_sx = tk.Scrollbar(right_wrap, orient=tk.HORIZONTAL, command=right_cv.xview)
+        right_cv.configure(yscrollcommand=right_sy.set, xscrollcommand=right_sx.set)
+        right_sy.pack(side=tk.RIGHT, fill=tk.Y)
+        right_sx.pack(side=tk.BOTTOM, fill=tk.X)
+        right_cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = tk.Frame(right_cv, bg=COLORS["surface"])
+        right_id = right_cv.create_window((0, 0), window=right, anchor=tk.NW)
+
+        def _right_cfg(e=None):
+            right_cv.configure(scrollregion=right_cv.bbox("all") or (0, 0, 200, 400))
+            try:
+                right_cv.itemconfigure(right_id, width=max(right_cv.winfo_width(), 180))
+            except Exception:
+                pass
+        right.bind("<Configure>", _right_cfg)
+        right_cv.bind("<Configure>", _right_cfg)
+
         tk.Label(right, text="Tools", bg=COLORS["surface"], fg=COLORS["text_dim"],
                  font=("Segoe UI", 9)).pack(anchor=tk.W)
         for text, cmd in [
@@ -1535,7 +1596,6 @@ class DocumentScannerWindow(tk.Toplevel):
                 relief=tk.FLAT, padx=10, pady=6, font=("Segoe UI", 9), cursor="hand2",
                 anchor=tk.W,
             ).pack(fill=tk.X, pady=3)
-
         tk.Label(right, text="Filter (apply on image)", bg=COLORS["surface"], fg=COLORS["text_dim"],
                  font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(12, 2))
         tk.Label(right, text="B&W / B&W Strong = black & white", bg=COLORS["surface"],
@@ -1548,6 +1608,9 @@ class DocumentScannerWindow(tk.Toplevel):
                 bg=COLORS["surface"], fg=COLORS["text"], selectcolor=COLORS["surface2"],
                 activebackground=COLORS["surface"], font=("Segoe UI", 9), anchor=tk.W,
             ).pack(fill=tk.X)
+        self._bind_mousewheel(right, right_cv)
+        self.after(80, _right_cfg)
+        self.after(80, _left_cfg)
 
         bottom = tk.Frame(self, bg=COLORS["surface"])
         bottom.pack(fill=tk.X, padx=12, pady=12)
@@ -2316,46 +2379,89 @@ class OnePDFEditor(tk.Tk):
 
         toolbar = tk.Frame(self, bg=COLORS["toolbar"])
         toolbar.pack(side=tk.TOP, fill=tk.X)
-        # Row 1 — file / edit / tools (always visible)
-        row1 = tk.Frame(toolbar, bg=COLORS["toolbar"])
-        row1.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(6, 2))
-        for text, cmd in [("Open", self.open_file), ("Save", self.save_pdf), ("Save As", self.save_as_pdf)]:
-            self._make_tool_btn(row1, text, cmd).pack(side=tk.LEFT, padx=2)
-        self.btn_edit_mode = self._make_tool_btn(row1, "View Mode", self.toggle_edit_mode)
-        self.btn_edit_mode.pack(side=tk.LEFT, padx=6)
-        self.btn_edit_mode.config(bg="#0ea5e9", fg="white")
-        self._make_tool_btn(row1, "Print", self.print_document).pack(side=tk.LEFT, padx=2)
-        self._make_tool_btn(row1, "Merge", self.open_pdf_merger).pack(side=tk.LEFT, padx=2)
-        self._make_tool_btn(row1, "Scanner", self.open_document_scanner).pack(side=tk.LEFT, padx=2)
-        tk.Frame(row1, width=8, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
-        for text, cmd in [("Undo", self.undo), ("Search", self.show_search)]:
-            self._make_tool_btn(row1, text, cmd).pack(side=tk.LEFT, padx=2)
-        self._make_tool_btn(row1, "Copy Text", self.copy_all_text_lines).pack(side=tk.LEFT, padx=2)
-        self._make_tool_btn(row1, "Letters", self.copy_selection_letters).pack(side=tk.LEFT, padx=2)
-        self._make_tool_btn(row1, "✓", lambda: self.start_place_symbol("✓")).pack(side=tk.LEFT, padx=2)
-        tk.Frame(row1, width=8, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
-        for text, cmd in [("Sign", self.start_signature), ("Copy Sign", self.start_copy_sign_region),
-                          ("Fill Box", self.start_fill_box), ("Screenshot", self.take_screenshot)]:
-            self._make_tool_btn(row1, text, cmd).pack(side=tk.LEFT, padx=2)
-        # Row 2 — page / zoom (fits small widths)
-        row2 = tk.Frame(toolbar, bg=COLORS["toolbar"])
-        row2.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(2, 6))
-        self._make_tool_btn(row2, "Prev", self.prev_page).pack(side=tk.LEFT, padx=2)
-        self._make_tool_btn(row2, "Next", self.next_page).pack(side=tk.LEFT, padx=2)
-        tk.Label(row2, text="Page", bg=COLORS["toolbar"], fg=COLORS["text_dim"], font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(8, 2))
+        flow = tk.Frame(toolbar, bg=COLORS["toolbar"])
+        flow.pack(side=tk.TOP, fill=tk.X, padx=4, pady=4)
+        self._toolbar_flow = flow
+        self._toolbar_items = []
+
+        def add_btn(text, cmd, **kw):
+            b = self._make_tool_btn(flow, text, cmd)
+            if kw:
+                b.config(**kw)
+            self._toolbar_items.append(b)
+            return b
+
+        add_btn("Open", self.open_file)
+        add_btn("Save", self.save_pdf)
+        add_btn("Save As", self.save_as_pdf)
+        self.btn_edit_mode = add_btn("View Mode", self.toggle_edit_mode, bg="#0ea5e9", fg="white")
+        add_btn("Print", self.print_document)
+        add_btn("Merge", self.open_pdf_merger)
+        add_btn("Scanner", self.open_document_scanner)
+        add_btn("Undo", self.undo)
+        add_btn("Search", self.show_search)
+        add_btn("Copy Text", self.copy_all_text_lines)
+        add_btn("Letters", self.copy_selection_letters)
+        add_btn("✓", lambda: self.start_place_symbol("✓"))
+        add_btn("Sign", self.start_signature)
+        add_btn("Copy Sign", self.start_copy_sign_region)
+        add_btn("Fill Box", self.start_fill_box)
+        add_btn("Screenshot", self.take_screenshot)
+        add_btn("Prev", self.prev_page)
+        add_btn("Next", self.next_page)
+        page_lab = tk.Label(flow, text="Page", bg=COLORS["toolbar"], fg=COLORS["text_dim"], font=("Segoe UI", 9))
+        self._toolbar_items.append(page_lab)
         self.page_var = tk.StringVar(value="1")
-        page_entry = tk.Entry(row2, textvariable=self.page_var, width=4, bg=COLORS["surface2"], fg=COLORS["text"],
+        page_entry = tk.Entry(flow, textvariable=self.page_var, width=4, bg=COLORS["surface2"], fg=COLORS["text"],
                               insertbackground=COLORS["text"], relief=tk.FLAT, font=("Segoe UI", 10))
-        page_entry.pack(side=tk.LEFT)
         page_entry.bind("<Return>", self._goto_page)
-        self.page_count_lbl = tk.Label(row2, text="/ 0", bg=COLORS["toolbar"], fg=COLORS["text_dim"], font=("Segoe UI", 9))
-        self.page_count_lbl.pack(side=tk.LEFT, padx=4)
-        tk.Frame(row2, width=12, bg=COLORS["toolbar"]).pack(side=tk.LEFT)
-        self._make_tool_btn(row2, "-", lambda: self.set_zoom(self.zoom / 1.25)).pack(side=tk.LEFT)
-        self.zoom_lbl = tk.Label(row2, text="100%", bg=COLORS["toolbar"], fg=COLORS["text"], font=("Segoe UI", 9), width=5)
-        self.zoom_lbl.pack(side=tk.LEFT, padx=4)
-        self._make_tool_btn(row2, "+", lambda: self.set_zoom(self.zoom * 1.25)).pack(side=tk.LEFT)
-        self._make_tool_btn(row2, "Fit", self.fit_page).pack(side=tk.LEFT, padx=4)
+        self._toolbar_items.append(page_entry)
+        self.page_count_lbl = tk.Label(flow, text="/ 0", bg=COLORS["toolbar"], fg=COLORS["text_dim"], font=("Segoe UI", 9))
+        self._toolbar_items.append(self.page_count_lbl)
+        add_btn("-", lambda: self.set_zoom(self.zoom / 1.25))
+        self.zoom_lbl = tk.Label(flow, text="100%", bg=COLORS["toolbar"], fg=COLORS["text"], font=("Segoe UI", 9), width=5)
+        self._toolbar_items.append(self.zoom_lbl)
+        add_btn("+", lambda: self.set_zoom(self.zoom * 1.25))
+        add_btn("Fit", self.fit_page)
+
+        self._tb_sizes = []
+        self._tb_job = None
+        self._tb_last_w = 0
+
+        def _reflow_toolbar(event=None):
+            try:
+                width = max(flow.winfo_width(), 120)
+                if abs(width - self._tb_last_w) < 8 and self._tb_sizes:
+                    return
+                self._tb_last_w = width
+                if not self._tb_sizes:
+                    for wdg in self._toolbar_items:
+                        self._tb_sizes.append((wdg.winfo_reqwidth(), wdg.winfo_reqheight()))
+                x, y = 4, 4
+                row_h = 0
+                for wdg, (rw, rh) in zip(self._toolbar_items, self._tb_sizes):
+                    if x > 4 and x + rw + 6 > width:
+                        x = 4
+                        y += row_h + 4
+                        row_h = 0
+                    wdg.place(x=x, y=y)
+                    x += rw + 4
+                    row_h = max(row_h, rh)
+                flow.configure(height=y + row_h + 6)
+            except Exception:
+                pass
+
+        def _tb_schedule(event=None):
+            if self._tb_job:
+                try:
+                    self.after_cancel(self._tb_job)
+                except Exception:
+                    pass
+            self._tb_job = self.after(40, _reflow_toolbar)
+
+        self._reflow_toolbar = _reflow_toolbar
+        toolbar.bind("<Configure>", _tb_schedule)
+        self.after(60, _reflow_toolbar)
 
         # Tab bar (up to 6 open files)
         self.tab_bar = tk.Frame(self, bg=COLORS["surface"], height=34)
